@@ -54,6 +54,8 @@ class OpenCodeMonitor:
         self._last_part_time: dict[str, int] = {}
         # Cache message roles: message_id -> role
         self._message_roles: dict[str, str] = {}
+        # Track seen part IDs per session to avoid double-processing
+        self._seen_part_ids: dict[str, set[str]] = {}
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -149,6 +151,7 @@ class OpenCodeMonitor:
                     msg_data = json.loads(row["message_data"])
 
                     # Inject metadata for parser and cursor tracking
+                    part_data["_part_id"] = row["id"]
                     part_data["_message_id"] = row["message_id"]
                     part_data["_time_created"] = row["time_created"]
                     part_data["_timestamp"] = datetime.fromtimestamp(
@@ -254,37 +257,62 @@ class OpenCodeMonitor:
                 session_id[:16],
             )
 
-            # Parse into display entries
-            parsed = opencode_parser.parse_parts(new_parts, self._message_roles)
+            # Filter to unseen parts only (avoid double-processing)
+            seen = self._seen_part_ids.setdefault(session_id, set())
+            unseen_parts = [p for p in new_parts if p["_part_id"] not in seen]
 
-            # Emit messages via callback
-            for entry in parsed:
-                if not entry.text:
-                    continue
-                # Skip user messages unless configured to show
-                if entry.role == "user" and not config.show_user_messages:
-                    continue
-                if self._message_callback:
-                    try:
-                        await self._message_callback(
-                            NewMessage(
-                                session_id=session_id,
-                                text=entry.text,
-                                is_complete=True,
-                                content_type=entry.content_type,
-                                tool_use_id=entry.tool_use_id,
-                                role=entry.role,
-                                tool_name=entry.tool_name,
+            if unseen_parts:
+                # Parse into display entries
+                parsed = opencode_parser.parse_parts(unseen_parts, self._message_roles)
+
+                # Emit messages via callback
+                for entry in parsed:
+                    if not entry.text:
+                        continue
+                    # Skip user messages unless configured to show
+                    if entry.role == "user" and not config.show_user_messages:
+                        continue
+                    if self._message_callback:
+                        try:
+                            await self._message_callback(
+                                NewMessage(
+                                    session_id=session_id,
+                                    text=entry.text,
+                                    is_complete=True,
+                                    content_type=entry.content_type,
+                                    tool_use_id=entry.tool_use_id,
+                                    role=entry.role,
+                                    tool_name=entry.tool_name,
+                                )
                             )
-                        )
-                    except Exception as e:
-                        logger.error("Message callback error: %s", e)
+                        except Exception as e:
+                            logger.error("Message callback error: %s", e)
 
-            # Advance cursor to latest part time
-            max_time = max(p["_time_created"] for p in new_parts)
-            self._last_part_time[session_id] = max(
-                self._last_part_time.get(session_id, 0), max_time
-            )
+            # Advance cursor only past parts with content.
+            # Empty streaming text parts are skipped so we re-read them next poll.
+            content_times = []
+            for p in new_parts:  # ALL parts, not just unseen
+                ptype = p.get("type", "")
+                text = p.get("text", "")
+                part_id = p["_part_id"]
+
+                if ptype == "text" and not text.strip():
+                    # Empty streaming text — don't advance past it
+                    continue
+                # Non-empty text or any non-text part: mark seen and include in cursor
+                seen.add(part_id)
+                content_times.append(p["_time_created"])
+
+            if content_times:
+                max_time = max(content_times)
+                self._last_part_time[session_id] = max(
+                    self._last_part_time.get(session_id, 0), max_time
+                )
+
+        # Clean up seen IDs for sessions we no longer track
+        stale = set(self._seen_part_ids) - set(active_sessions)
+        for sid in stale:
+            del self._seen_part_ids[sid]
 
     async def _monitor_loop(self) -> None:
         """Background polling loop."""
