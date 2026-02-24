@@ -47,8 +47,12 @@ def main() -> None:
 
     from .tmux_manager import tmux_manager
 
+    logger.info("Backend: %s", config.backend)
     logger.info("Allowed users: %s", config.allowed_users)
-    logger.info("Claude projects path: %s", config.claude_projects_path)
+    if config.backend == "opencode":
+        logger.info("OpenCode DB path: %s", config.opencode_db_path)
+    else:
+        logger.info("Claude projects path: %s", config.claude_projects_path)
 
     # Ensure tmux session exists
     session = tmux_manager.get_or_create_session()

@@ -123,6 +123,7 @@ from .handlers.status_polling import status_poll_loop
 from .screenshot import text_to_image
 from .session import session_manager
 from .session_monitor import NewMessage, SessionMonitor
+from .opencode_monitor import OpenCodeMonitor
 from .terminal_parser import extract_bash_output
 from .tmux_manager import tmux_manager
 from .utils import ccbot_dir
@@ -130,7 +131,7 @@ from .utils import ccbot_dir
 logger = logging.getLogger(__name__)
 
 # Session monitor instance
-session_monitor: SessionMonitor | None = None
+session_monitor: SessionMonitor | OpenCodeMonitor | None = None
 
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
@@ -1029,8 +1030,12 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 user.id,
                 pending_thread_id,
             )
-            # Wait for Claude Code's SessionStart hook to register in session_map
-            await session_manager.wait_for_session_map_entry(created_wid)
+            # Wait for session registration.
+            # Claude: waits for SessionStart hook to write session_map.json
+            # OpenCode: no hooks; the monitor discovers sessions by directory
+            #   on the next poll cycle (~2s), so just bind immediately.
+            if config.backend != "opencode":
+                await session_manager.wait_for_session_map_entry(created_wid)
 
             if pending_thread_id is not None:
                 # Thread bind flow: bind thread to newly created window
@@ -1417,7 +1422,10 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
     )
 
     # Find users whose thread-bound window matches this session
-    active_users = await session_manager.find_users_for_session(msg.session_id)
+    if config.backend == "opencode":
+        active_users = session_manager.find_users_for_session_direct(msg.session_id)
+    else:
+        active_users = await session_manager.find_users_for_session(msg.session_id)
 
     if not active_users:
         logger.info(f"No active users for session {msg.session_id}")
@@ -1436,16 +1444,17 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
             await asyncio.sleep(0.3)
             handled = await handle_interactive_ui(bot, user_id, wid, thread_id)
             if handled:
-                # Update user's read offset
-                session = await session_manager.resolve_session_for_window(wid)
-                if session and session.file_path:
-                    try:
-                        file_size = Path(session.file_path).stat().st_size
-                        session_manager.update_user_window_offset(
-                            user_id, wid, file_size
-                        )
-                    except OSError:
-                        pass
+                # Update user's read offset (Claude Code backend only)
+                if config.backend != "opencode":
+                    session = await session_manager.resolve_session_for_window(wid)
+                    if session and session.file_path:
+                        try:
+                            file_size = Path(session.file_path).stat().st_size
+                            session_manager.update_user_window_offset(
+                                user_id, wid, file_size
+                            )
+                        except OSError:
+                            pass
                 continue  # Don't send the normal tool_use message
             else:
                 # UI not rendered — clear the early-set mode
@@ -1480,13 +1489,17 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
 
             # Update user's read offset to current file position
             # This marks these messages as "read" for this user
-            session = await session_manager.resolve_session_for_window(wid)
-            if session and session.file_path:
-                try:
-                    file_size = Path(session.file_path).stat().st_size
-                    session_manager.update_user_window_offset(user_id, wid, file_size)
-                except OSError:
-                    pass
+            # (Claude Code backend only — opencode uses time-based cursors)
+            if config.backend != "opencode":
+                session = await session_manager.resolve_session_for_window(wid)
+                if session and session.file_path:
+                    try:
+                        file_size = Path(session.file_path).stat().st_size
+                        session_manager.update_user_window_offset(
+                            user_id, wid, file_size
+                        )
+                    except OSError:
+                        pass
 
 
 # --- App lifecycle ---
@@ -1526,7 +1539,12 @@ async def post_init(application: Application) -> None:
         rate_limiter._base_limiter._level = rate_limiter._base_limiter.max_rate
         logger.info("Pre-filled global rate limiter bucket")
 
-    monitor = SessionMonitor()
+    if config.backend == "opencode":
+        monitor = OpenCodeMonitor()
+        logger.info("Using OpenCode backend (SQLite: %s)", config.opencode_db_path)
+    else:
+        monitor = SessionMonitor()
+        logger.info("Using Claude Code backend (projects: %s)", config.claude_projects_path)
 
     async def message_callback(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)

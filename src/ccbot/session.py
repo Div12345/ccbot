@@ -755,6 +755,24 @@ class SessionManager:
                 result.append((user_id, window_id, thread_id))
         return result
 
+    def find_users_for_session_direct(
+        self,
+        session_id: str,
+    ) -> list[tuple[int, str, int]]:
+        """Find users by session_id using in-memory window_states only.
+
+        Used by the OpenCode backend where session→window mapping is
+        maintained by the monitor (no JSONL files to resolve against).
+
+        Returns list of (user_id, window_id, thread_id) tuples.
+        """
+        result: list[tuple[int, str, int]] = []
+        for user_id, thread_id, window_id in self.iter_thread_bindings():
+            state = self.window_states.get(window_id)
+            if state and state.session_id == session_id:
+                result.append((user_id, window_id, thread_id))
+        return result
+
     # --- Tmux helpers ---
 
     async def send_to_window(self, window_id: str, text: str) -> tuple[bool, str]:

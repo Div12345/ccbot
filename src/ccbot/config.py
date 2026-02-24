@@ -66,6 +66,9 @@ class Config:
         self.session_map_file = self.config_dir / "session_map.json"
         self.monitor_state_file = self.config_dir / "monitor_state.json"
 
+        # Backend selection: "claude" (default) or "opencode"
+        self.backend = os.getenv("CCBOT_BACKEND", "claude")
+
         # Claude Code session monitoring configuration
         # Support custom projects path for Claude variants (e.g., cc-mirror, zai)
         # Priority: CCBOT_CLAUDE_PROJECTS_PATH > CLAUDE_CONFIG_DIR/projects > default
@@ -78,6 +81,15 @@ class Config:
             self.claude_projects_path = Path(claude_config_dir) / "projects"
         else:
             self.claude_projects_path = Path.home() / ".claude" / "projects"
+
+        # OpenCode database path (used when backend=opencode)
+        opencode_db = os.getenv("OPENCODE_DB_PATH")
+        if opencode_db:
+            self.opencode_db_path = Path(opencode_db)
+        else:
+            self.opencode_db_path = (
+                Path.home() / ".local" / "share" / "opencode" / "opencode.db"
+            )
 
         self.monitor_poll_interval = float(os.getenv("MONITOR_POLL_INTERVAL", "2.0"))
 
@@ -92,11 +104,12 @@ class Config:
 
         logger.debug(
             "Config initialized: dir=%s, token=%s..., allowed_users=%d, "
-            "tmux_session=%s, claude_projects_path=%s",
+            "tmux_session=%s, backend=%s, claude_projects_path=%s",
             self.config_dir,
             self.telegram_bot_token[:8],
             len(self.allowed_users),
             self.tmux_session_name,
+            self.backend,
             self.claude_projects_path,
         )
 
