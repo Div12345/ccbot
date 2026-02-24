@@ -79,6 +79,42 @@ def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     return _message_queues.get(user_id)
 
 
+async def flush_queue(user_id: int, thread_id: int | None = None) -> int:
+    """Drain pending tasks from a user's queue. Returns count of dropped tasks.
+
+    If thread_id is given, only flush tasks for that thread (put others back).
+    """
+    queue = _message_queues.get(user_id)
+    if not queue:
+        return 0
+
+    tasks: list[MessageTask] = []
+    while not queue.empty():
+        try:
+            tasks.append(queue.get_nowait())
+            queue.task_done()
+        except asyncio.QueueEmpty:
+            break
+
+    if thread_id is not None:
+        dropped = 0
+        for task in tasks:
+            if task.thread_id == thread_id:
+                dropped += 1
+            else:
+                await queue.put(task)
+    else:
+        dropped = len(tasks)
+
+    logger.info(
+        "Flushed %d tasks from queue for user %d (thread=%s)",
+        dropped,
+        user_id,
+        thread_id,
+    )
+    return dropped
+
+
 def get_or_create_queue(bot: Bot, user_id: int) -> asyncio.Queue[MessageTask]:
     """Get or create message queue and worker for a user."""
     if user_id not in _message_queues:
