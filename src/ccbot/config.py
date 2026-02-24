@@ -97,6 +97,13 @@ class Config:
         # When True, user messages are shown with a 👤 prefix
         self.show_user_messages = True
 
+        # Content verbosity: 0=quiet, 1=normal (default), 2=verbose
+        # Controls how much tool activity is shown on Telegram.
+        # 0: only final text responses
+        # 1: tool names + icon, suppress tool_result + thinking
+        # 2: everything (backward compatible)
+        self.verbose_level = int(os.getenv("CCBOT_VERBOSE_LEVEL", "1"))
+
         # Show hidden (dot) directories in directory browser
         self.show_hidden_dirs = (
             os.getenv("CCBOT_SHOW_HIDDEN_DIRS", "").lower() == "true"
