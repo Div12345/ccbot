@@ -691,6 +691,103 @@ def _lb_key(thread_id: int | None) -> str:
     return f"lb:{thread_id or 0}"
 
 
+def _discover_backends() -> list[dict]:
+    """Discover installed CLI backends by checking PATH."""
+    import shutil
+
+    backends = []
+    if shutil.which("claude"):
+        backends.append({"id": "claude", "name": "Claude Code", "icon": "🟣"})
+    if shutil.which("opencode"):
+        backends.append({"id": "opencode", "name": "OpenCode", "icon": "🟢"})
+    return backends
+
+
+def _discover_models(backend: str) -> dict:
+    """Discover available models for a backend.
+
+    Returns {"providers": [{"id", "name", "models": [{"id", "name"}]}]}
+    For Claude: single provider with alias models.
+    For OpenCode: runs `opencode models` and groups by provider, with
+    custom-configured models from opencode.json shown first.
+    """
+    import json as _json
+    import subprocess
+
+    result: dict[str, list] = {"providers": []}
+
+    if backend == "claude":
+        result["providers"].append({
+            "id": "claude",
+            "name": "Claude Code",
+            "models": [
+                {"id": "default", "name": "Default"},
+                {"id": "opus", "name": "Opus (strongest)"},
+                {"id": "sonnet", "name": "Sonnet (balanced)"},
+                {"id": "haiku", "name": "Haiku (fast)"},
+            ],
+        })
+
+    elif backend == "opencode":
+        # 1. Custom models from opencode.json config (user-configured)
+        custom_models: list[dict] = []
+        oc_config = Path.home() / ".config" / "opencode" / "opencode.json"
+        if oc_config.exists():
+            try:
+                data = _json.loads(oc_config.read_text())
+                for _prov, prov_data in data.get("provider", {}).items():
+                    for mid, minfo in prov_data.get("models", {}).items():
+                        display = minfo.get("name", mid)
+                        if len(mid) <= 55:
+                            custom_models.append({"id": mid, "name": display})
+            except (ValueError, KeyError):
+                pass
+
+        if custom_models:
+            result["providers"].append({
+                "id": "_custom",
+                "name": "⭐ Configured",
+                "models": [{"id": "default", "name": "Default"}] + custom_models,
+            })
+
+        # 2. Live models from `opencode models`
+        try:
+            proc = subprocess.run(
+                ["opencode", "models"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if proc.returncode == 0:
+                grouped: dict[str, list[dict]] = {}
+                for line in proc.stdout.strip().splitlines():
+                    line = line.strip()
+                    if "/" not in line or len(line) > 55:
+                        continue
+                    provider = line.split("/")[0]
+                    model_short = line.split("/", 1)[1]
+                    grouped.setdefault(provider, []).append(
+                        {"id": line, "name": model_short}
+                    )
+                # Add each provider group
+                for prov_id, models in sorted(grouped.items()):
+                    result["providers"].append({
+                        "id": prov_id,
+                        "name": prov_id.title(),
+                        "models": models,
+                    })
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+        # Ensure at least a default
+        if not result["providers"]:
+            result["providers"].append({
+                "id": "_default",
+                "name": "OpenCode",
+                "models": [{"id": "default", "name": "Default"}],
+            })
+
+    return result
+
+
 def _get_known_dirs() -> list[str]:
     """Collect known directories from profiles and active sessions."""
     dirs: dict[str, bool] = {}
@@ -722,6 +819,7 @@ def _build_lb_message(lb: dict) -> tuple[str, InlineKeyboardMarkup]:
     model = lb.get("model", "")
     dir_idx = lb.get("dir_idx", -1)
     known_dirs = lb.get("known_dirs", [])
+    models = lb.get("models", [])
     skip_perms = lb.get("skip_perms", True)
     resume = lb.get("resume", True)
 
@@ -731,16 +829,21 @@ def _build_lb_message(lb: dict) -> tuple[str, InlineKeyboardMarkup]:
     if backend:
         lines.append(f"Backend: `{backend}` ✓")
     if model:
-        lines.append(f"Model: `{model}` ✓")
+        # Find display name from models list
+        model_name = model
+        for m in models:
+            if m["id"] == model:
+                model_name = m["name"]
+                break
+        lines.append(f"Model: `{model_name}` ✓")
     elif backend:
         lines.append("Model: `default` ✓")
-    if dir_idx >= 0 and dir_idx < len(known_dirs):
+    if 0 <= dir_idx < len(known_dirs):
         lines.append(f"Dir: `{_short_dir(known_dirs[dir_idx])}` ✓")
 
     buttons: list[list[InlineKeyboardButton]] = []
 
     if step == "main":
-        # Show saved profiles as quick-launch + custom build
         lines.append("")
         lines.append("Quick launch or build custom:")
         profiles = profile_manager.list_profiles()
@@ -758,33 +861,68 @@ def _build_lb_message(lb: dict) -> tuple[str, InlineKeyboardMarkup]:
 
     elif step == "backend":
         lines.append("")
-        lines.append("Pick backend:")
-        buttons.append([
-            InlineKeyboardButton("Claude", callback_data=f"{CB_LB_BACKEND}claude"),
-            InlineKeyboardButton("OpenCode", callback_data=f"{CB_LB_BACKEND}opencode"),
-        ])
+        backends = lb.get("backends", [])
+        if not backends:
+            lines.append("No backends found!")
+        else:
+            lines.append("Pick backend:")
+            row = []
+            for b in backends:
+                label = f"{b['icon']} {b['name']}"
+                row.append(InlineKeyboardButton(label, callback_data=f"{CB_LB_BACKEND}{b['id']}"))
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
 
     elif step == "model":
         lines.append("")
-        lines.append("Pick model:")
-        if backend == "claude":
-            buttons.append([
-                InlineKeyboardButton("Default", callback_data=f"{CB_LB_MODEL}default"),
-                InlineKeyboardButton("Opus", callback_data=f"{CB_LB_MODEL}opus"),
-            ])
-            buttons.append([
-                InlineKeyboardButton("Sonnet", callback_data=f"{CB_LB_MODEL}sonnet"),
-                InlineKeyboardButton("Haiku", callback_data=f"{CB_LB_MODEL}haiku"),
-            ])
+        model_data = lb.get("model_data", {})
+        providers = model_data.get("providers", [])
+        selected_prov = lb.get("model_provider", "")
+
+        if not providers:
+            lines.append("No models found!")
+        elif len(providers) == 1 or selected_prov:
+            # Single provider or provider already chosen — show models
+            prov_models = []
+            for p in providers:
+                if selected_prov and p["id"] != selected_prov:
+                    continue
+                prov_models = p.get("models", [])
+                break
+            if not prov_models and providers:
+                prov_models = providers[0].get("models", [])
+
+            prov_name = selected_prov or providers[0]["id"]
+            lines.append(f"Pick model ({prov_name}, {len(prov_models)} available):")
+            row = []
+            for m in prov_models:
+                label = m["name"]
+                if len(label) > 28:
+                    label = label[:25] + "…"
+                row.append(InlineKeyboardButton(label, callback_data=f"{CB_LB_MODEL}{m['id']}"))
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
+            # Back to provider list if multiple providers
+            if len(providers) > 1:
+                buttons.append([InlineKeyboardButton("← Other providers", callback_data=f"{CB_LB_MODEL}@back")])
         else:
-            buttons.append([
-                InlineKeyboardButton("Default", callback_data=f"{CB_LB_MODEL}default"),
-            ])
+            # Multiple providers — show provider picker
+            lines.append(f"Pick provider ({len(providers)} available):")
+            for p in providers:
+                count = len(p.get("models", []))
+                label = f"{p['name']} ({count})"
+                buttons.append([InlineKeyboardButton(label, callback_data=f"{CB_LB_MODEL}@{p['id']}")])
 
     elif step == "dir":
         lines.append("")
         lines.append("Pick directory:")
-        for i, d in enumerate(known_dirs[:6]):
+        for i, d in enumerate(known_dirs[:8]):
             buttons.append([InlineKeyboardButton(
                 f"📂 {_short_dir(d)}",
                 callback_data=f"{CB_LB_DIR}{i}",
@@ -2196,16 +2334,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if data.startswith(CB_LB_BACKEND):
             val = data[len(CB_LB_BACKEND):]
             if val == "pick":
+                lb["backends"] = _discover_backends()
                 lb["step"] = "backend"
             else:
                 lb["backend"] = val
+                lb["model_data"] = _discover_models(val)
+                lb["model_provider"] = ""
                 lb["step"] = "model"
 
-        # Step: pick model
+        # Step: pick model (handles provider sub-navigation)
         elif data.startswith(CB_LB_MODEL):
             val = data[len(CB_LB_MODEL):]
-            lb["model"] = "" if val == "default" else val
-            lb["step"] = "dir"
+            if val.startswith("@"):
+                # Provider navigation
+                prov_id = val[1:]
+                if prov_id == "back":
+                    lb["model_provider"] = ""
+                else:
+                    lb["model_provider"] = prov_id
+                # Stay on model step
+            else:
+                # Actual model selected
+                lb["model"] = "" if val == "default" else val
+                lb["step"] = "dir"
 
         # Step: pick directory
         elif data.startswith(CB_LB_DIR):
@@ -2244,8 +2395,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 backend if backend != "claude" else config.claude_command
             ]
             if model:
-                cmd_parts.append(f"--model {model}")
-            if skip_perms:
+                # OpenCode uses -m provider/model, Claude uses --model alias
+                flag = "-m" if backend == "opencode" else "--model"
+                cmd_parts.append(f"{flag} {model}")
+            if skip_perms and backend == "claude":
                 cmd_parts.append("--dangerously-skip-permissions")
 
             cli_command = " ".join(cmd_parts)
