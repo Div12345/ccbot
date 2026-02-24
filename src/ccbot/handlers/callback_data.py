@@ -44,3 +44,18 @@ CB_ASK_REFRESH = "aq:ref:"  # aq:ref:<window>
 
 # Screenshot control keys
 CB_KEYS_PREFIX = "kb:"  # kb:<key_id>:<window>
+
+# Profile system
+CB_PROFILE_LAUNCH = "pf:launch:"   # pf:launch:<slug>
+CB_PROFILE_SUSPEND = "pf:suspend:" # pf:suspend:<slug>
+CB_PROFILE_INFO = "pf:info:"       # pf:info:<slug>
+
+# Launch builder wizard
+CB_LB_BACKEND = "lb:b:"     # lb:b:claude / lb:b:opencode
+CB_LB_MODEL = "lb:m:"       # lb:m:opus / lb:m:sonnet / lb:m:default / lb:m:haiku
+CB_LB_DIR = "lb:d:"         # lb:d:<index> into known dirs list
+CB_LB_DIR_BROWSE = "lb:d:browse"
+CB_LB_FLAG = "lb:f:"        # lb:f:skip / lb:f:resume — toggles
+CB_LB_GO = "lb:go"          # launch with current settings
+CB_LB_SAVE = "lb:save"      # prompt to save as profile
+CB_LB_PROFILE = "lb:pf:"    # lb:pf:<slug> — quick launch saved profile

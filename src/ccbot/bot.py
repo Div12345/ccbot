@@ -56,6 +56,8 @@ from telegram.ext import (
 )
 
 from .config import config
+from .diagnostics import get_status_summary, get_ps_output, get_diag_output, get_alive_check
+from .profiles import profile_manager
 from .handlers.callback_data import (
     CB_ASK_DOWN,
     CB_ASK_ENTER,
@@ -74,6 +76,17 @@ from .handlers.callback_data import (
     CB_HISTORY_NEXT,
     CB_HISTORY_PREV,
     CB_KEYS_PREFIX,
+    CB_LB_BACKEND,
+    CB_LB_DIR,
+    CB_LB_DIR_BROWSE,
+    CB_LB_FLAG,
+    CB_LB_GO,
+    CB_LB_MODEL,
+    CB_LB_PROFILE,
+    CB_LB_SAVE,
+    CB_PROFILE_INFO,
+    CB_PROFILE_LAUNCH,
+    CB_PROFILE_SUSPEND,
     CB_SCREENSHOT_REFRESH,
     CB_WIN_BIND,
     CB_WIN_CANCEL,
@@ -136,14 +149,99 @@ session_monitor: SessionMonitor | OpenCodeMonitor | None = None
 # Status polling task
 _status_poll_task: asyncio.Task | None = None
 
-# Claude Code commands shown in bot menu (forwarded via tmux)
+# Claude Code slash commands — forwarded to the CLI when used in a topic.
+# Organized by category for /cmds searchability.
 CC_COMMANDS: dict[str, str] = {
+    # Session
     "clear": "↗ Clear conversation history",
     "compact": "↗ Compact conversation context",
-    "cost": "↗ Show token/cost usage",
-    "help": "↗ Show Claude Code help",
-    "memory": "↗ Edit CLAUDE.md",
+    "resume": "↗ Resume a previous session",
+    # Model & config
     "model": "↗ Switch AI model",
+    "permissions": "↗ Manage tool permissions",
+    # Info
+    "cost": "↗ Show token/cost usage",
+    "context": "↗ Show context usage grid",
+    # Files
+    "memory": "↗ Edit CLAUDE.md",
+    # Hooks
+    "hooks": "↗ Show active hooks",
+}
+
+# Extended command descriptions for /cmds search (not registered as BotCommands
+# to keep the Telegram menu clean, but shown in /cmds and forwarded on use)
+CC_COMMANDS_EXTENDED: dict[str, str] = {
+    **CC_COMMANDS,
+    # Additional commands that Claude Code supports
+    "init": "↗ Initialize project with CLAUDE.md",
+    "bug": "↗ Report a bug",
+    "terminal-setup": "↗ Configure terminal",
+    "doctor": "↗ Diagnose Claude Code issues",
+    "login": "↗ Authentication",
+    "logout": "↗ Log out",
+    "config": "↗ Claude Code configuration",
+    "mcp": "↗ MCP server management",
+    "listen": "↗ Listen for notifications",
+    "review": "↗ Code review mode",
+    "pr-review": "↗ Review a pull request",
+}
+
+# Categorized for /cmds display
+CC_COMMAND_CATEGORIES: dict[str, list[tuple[str, str]]] = {
+    "Session": [
+        ("/clear", "Clear conversation history"),
+        ("/compact", "Compact conversation context"),
+        ("/resume", "Resume a previous session"),
+    ],
+    "Model & Config": [
+        ("/model", "Switch AI model"),
+        ("/permissions", "Manage tool permissions"),
+        ("/config", "Claude Code configuration"),
+        ("/mcp", "MCP server management"),
+        ("/hooks", "Show active hooks"),
+    ],
+    "Info": [
+        ("/cost", "Token/cost usage"),
+        ("/context", "Context usage grid"),
+        ("/doctor", "Diagnose issues"),
+    ],
+    "Files": [
+        ("/memory", "Edit CLAUDE.md"),
+        ("/init", "Initialize project CLAUDE.md"),
+    ],
+    "Code": [
+        ("/review", "Code review mode"),
+        ("/pr-review", "Review a pull request"),
+    ],
+}
+
+# CCBot's own commands, categorized for /cmds
+CCBOT_COMMAND_CATEGORIES: dict[str, list[tuple[str, str]]] = {
+    "Monitor": [
+        ("/status", "Health check of entire stack"),
+        ("/alive", "Is Claude still writing?"),
+        ("/ps", "All tmux windows + processes"),
+        ("/diag", "Full diagnostic dump"),
+        ("/usage", "Quota remaining"),
+    ],
+    "Workspaces": [
+        ("/launch", "Interactive session launcher (pick backend/model/dir)"),
+        ("/profiles", "Launch/suspend workspace profiles"),
+        ("/screenshot", "Terminal screenshot + controls"),
+        ("/history", "Message history for topic"),
+    ],
+    "Control": [
+        ("/esc", "Send Escape to interrupt"),
+        ("/relaunch", "Exit + reopen Claude (reload MCP etc)"),
+        ("/kill", "Kill session + delete topic"),
+        ("/unbind", "Detach topic from session"),
+        ("/flush", "Clear message backlog"),
+        ("/verbose", "Set noise level (0/1/2)"),
+    ],
+    "Help": [
+        ("/help", "This command reference"),
+        ("/cmds", "Searchable command list"),
+    ],
 }
 
 
@@ -180,8 +278,184 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await safe_reply(
             update.message,
             "🤖 *Claude Code Monitor*\n\n"
-            "Each topic is a session. Create a new topic to start.",
+            "Each topic is a session. Create a new topic to start.\n"
+            "Type /help for all commands.",
         )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Smart help — organized by what you need to do."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    help_text = (
+        "📖 *Command Reference*\n"
+        "\n"
+        "*What's happening?*\n"
+        "  /status — quick health check (bot, profiles, system)\n"
+        "  /alive — is Claude still writing? (checks JSONL freshness)\n"
+        "  /ps — all tmux windows + what's running in each\n"
+        "  /diag — full diagnostic dump (when something's broken)\n"
+        "  /usage — Claude Code quota remaining\n"
+        "\n"
+        "*Workspaces:*\n"
+        "  /profiles — launch/suspend/manage saved workspaces\n"
+        "  /screenshot — see the terminal + control keys\n"
+        "  /history — message history for this topic\n"
+        "\n"
+        "*Control:*\n"
+        "  /esc — send Escape (interrupt Claude)\n"
+        "  /kill — kill session + delete topic\n"
+        "  /unbind — detach topic from session (keeps window)\n"
+        "  /flush — clear message backlog instantly\n"
+        "  /verbose 0|1|2 — noise level (0=quiet, 1=normal, 2=all)\n"
+        "\n"
+        "*Quick guide:*\n"
+        "  Slow/no messages? → /alive then /flush\n"
+        "  Backlog flooding? → /flush then /verbose 0\n"
+        "  Something broken? → /diag\n"
+        "  Start a workspace? → /profiles\n"
+        "  Need fresh session? → create a new topic\n"
+        "\n"
+        "Any /slash command not listed here gets forwarded to Claude Code."
+    )
+
+    if update.message:
+        await safe_reply(update.message, help_text)
+
+
+async def cmds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Searchable command list — /cmds or /cmds <search term>."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    # Parse search query
+    args = update.message.text.split(maxsplit=1)
+    search = args[1].lower().strip() if len(args) > 1 else ""
+
+    lines = []
+
+    if search:
+        lines.append(f"*Commands matching \"{search}\":*\n")
+        found = False
+        # Search CCBot commands
+        for cat, cmds in CCBOT_COMMAND_CATEGORIES.items():
+            matches = [(c, d) for c, d in cmds if search in c.lower() or search in d.lower()]
+            if matches:
+                found = True
+                lines.append(f"*{cat}* (ccbot):")
+                for cmd, desc in matches:
+                    lines.append(f"  `{cmd}` — {desc}")
+                lines.append("")
+        # Search CC commands
+        for cat, cmds in CC_COMMAND_CATEGORIES.items():
+            matches = [(c, d) for c, d in cmds if search in c.lower() or search in d.lower()]
+            if matches:
+                found = True
+                lines.append(f"*{cat}* (↗ Claude Code):")
+                for cmd, desc in matches:
+                    lines.append(f"  `{cmd}` — {desc}")
+                lines.append("")
+        if not found:
+            lines.append("No commands found. Try a broader search.")
+    else:
+        lines.append("*All Commands*\n")
+        lines.append("*— CCBot (runs here) —*\n")
+        for cat, cmds in CCBOT_COMMAND_CATEGORIES.items():
+            lines.append(f"*{cat}:*")
+            for cmd, desc in cmds:
+                lines.append(f"  `{cmd}` — {desc}")
+            lines.append("")
+        lines.append("*— Claude Code (↗ forwarded) —*\n")
+        for cat, cmds in CC_COMMAND_CATEGORIES.items():
+            lines.append(f"*{cat}:*")
+            for cmd, desc in cmds:
+                lines.append(f"  `{cmd}` — {desc}")
+            lines.append("")
+        lines.append("💡 `/cmds <word>` to search")
+
+    await safe_reply(update.message, "\n".join(lines))
+
+
+async def sessionconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show current session/profile configuration for this topic."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    lines = []
+
+    # Check if this topic is bound to a profile
+    profile = None
+    profile_state = None
+    if thread_id:
+        profile = profile_manager.find_by_topic(thread_id)
+        if profile:
+            profile_state = profile_manager.get_state(profile.slug)
+
+    if profile:
+        lines.append(f"{profile.icon} *{profile.name}* config:\n")
+        lines.append(f"  Dir: `{profile.directory}`")
+        lines.append(f"  Backend: `{profile.backend}`")
+        lines.append(f"  Model: `{profile.model or 'default'}`")
+        lines.append(f"  Flags: `{profile.flags or 'none'}`")
+        lines.append(f"  Resume: {'yes' if profile.resume else 'no'}")
+        lines.append(f"  Max idle: {profile.max_idle_minutes}m")
+        if profile.system_prompt:
+            prompt_preview = profile.system_prompt[:80].replace('\n', ' ')
+            lines.append(f"  Prompt: _{prompt_preview}..._")
+        if profile.obsidian_note:
+            lines.append(f"  Obsidian: `{profile.obsidian_note}`")
+        lines.append("")
+
+        # Runtime state
+        if profile_state:
+            if profile_state.window_id:
+                lines.append(f"  Window: `{profile_state.window_id}`")
+            if profile_state.last_session_id:
+                lines.append(f"  Session: `{profile_state.last_session_id[:16]}...`")
+            deep_link = profile_manager.get_telegram_deep_link(profile.slug)
+            if deep_link:
+                lines.append(f"  [Deep link]({deep_link})")
+    else:
+        # Not a profile topic — show generic session info
+        lines.append("*Session config:*\n")
+
+        if thread_id:
+            wid = session_manager.get_window_for_thread(user.id, thread_id)
+            if wid:
+                ws = session_manager.window_states.get(wid)
+                display = session_manager.get_display_name(wid)
+                lines.append(f"  Window: `{wid}` ({display})")
+                if ws:
+                    if ws.cwd:
+                        lines.append(f"  Dir: `{ws.cwd}`")
+                    if ws.session_id:
+                        lines.append(f"  Session: `{ws.session_id[:16]}...`")
+
+                w = await tmux_manager.find_window_by_id(wid)
+                if w:
+                    lines.append(f"  Process: `{w.pane_current_command or 'unknown'}`")
+            else:
+                lines.append("  No window bound to this topic.")
+        else:
+            lines.append("  Not in a topic. Use /profiles to launch a workspace.")
+
+    lines.append("")
+    lines.append(f"  Verbose: {config.verbose_level}")
+    lines.append(f"  Backend: `{config.backend}`")
+
+    lines.append("\n💡 To change model: `/model` (forwarded to Claude Code)")
+    lines.append("💡 To change verbose: `/verbose 0|1|2`")
+
+    await safe_reply(update.message, "\n".join(lines))
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -290,6 +564,431 @@ async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Send Escape control character (no enter)
     await tmux_manager.send_keys(w.window_id, "\x1b", enter=False)
     await safe_reply(update.message, "⎋ Sent Escape")
+
+
+async def verbose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set content verbosity: /verbose [0|1|2]."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    args = (update.message.text or "").split()
+    labels = {0: "Quiet (text only)", 1: "Normal (tool icons)", 2: "Verbose (everything)"}
+
+    if len(args) > 1 and args[1] in ("0", "1", "2"):
+        config.verbose_level = int(args[1])
+        await safe_reply(update.message, f"Verbosity: {labels[config.verbose_level]}")
+    else:
+        await safe_reply(
+            update.message,
+            f"Current: {config.verbose_level} — {labels[config.verbose_level]}\n"
+            "Usage: /verbose 0 | 1 | 2",
+        )
+
+
+async def flush_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Flush message backlog for this topic."""
+    import os as _os
+
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    from .handlers.message_queue import flush_queue
+
+    # 1. Drain the message queue for this thread
+    dropped = await flush_queue(user.id, thread_id)
+
+    # 2. Advance monitor read cursor to EOF
+    skipped_bytes = 0
+    if session_monitor:
+        wid = session_manager.get_window_for_thread(user.id, thread_id)
+        if wid:
+            ws = session_manager.window_states.get(wid)
+            if ws and ws.session_id:
+                tracked = session_monitor.state.get_session(ws.session_id)
+                if tracked and tracked.file_path:
+                    try:
+                        file_size = _os.path.getsize(tracked.file_path)
+                        skipped_bytes = max(0, file_size - tracked.last_byte_offset)
+                        tracked.last_byte_offset = file_size
+                        session_monitor.state.save()
+                    except OSError:
+                        pass
+
+    parts = []
+    if dropped:
+        parts.append(f"{dropped} queued msgs dropped")
+    if skipped_bytes:
+        parts.append(f"{skipped_bytes // 1024}KB monitor backlog skipped")
+    if not parts:
+        parts.append("nothing to flush")
+    await safe_reply(update.message, f"Flush: {', '.join(parts)}.")
+
+
+async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show profile picker as inline keyboard grid."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    profiles = profile_manager.list_profiles()
+    if not profiles:
+        if update.message:
+            await safe_reply(
+                update.message,
+                "No profiles configured.\n"
+                "Create profiles in `~/.ccbot/profiles/` as JSON files.\n\n"
+                "Example (`~/.ccbot/profiles/arterial.json`):\n"
+                "```\n"
+                "{\n"
+                '  "name": "Arterial Analysis",\n'
+                '  "icon": "🧪",\n'
+                '  "directory": "/path/to/project",\n'
+                '  "backend": "claude",\n'
+                '  "flags": "--dangerously-skip-permissions"\n'
+                "}\n"
+                "```",
+            )
+        return
+
+    # Build inline keyboard: 2 columns, icon + name, ● for active ○ for suspended
+    buttons = []
+    row = []
+    for profile, state in profiles:
+        is_active = bool(state.window_id)
+        indicator = "●" if is_active else "○"
+        label = f"{profile.icon} {profile.name} {indicator}"
+        callback = f"pf:launch:{profile.slug}" if not is_active else f"pf:info:{profile.slug}"
+        row.append(InlineKeyboardButton(label, callback_data=callback))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    keyboard = InlineKeyboardMarkup(buttons)
+    active = profile_manager.active_count()
+    if update.message:
+        await safe_reply(
+            update.message,
+            f"📋 *Profiles* ({active}/{profile_manager.MAX_ACTIVE} active)\n"
+            "● = live  ○ = suspended\n"
+            "Tap to launch or view info.",
+            reply_markup=keyboard,
+        )
+
+
+# --- Launch builder helpers ---
+
+def _lb_key(thread_id: int | None) -> str:
+    """User-data key for the launch builder state."""
+    return f"lb:{thread_id or 0}"
+
+
+def _get_known_dirs() -> list[str]:
+    """Collect known directories from profiles and active sessions."""
+    dirs: dict[str, bool] = {}
+    for prof in profile_manager.profiles.values():
+        if prof.directory:
+            dirs[prof.directory] = True
+    for ws in session_manager.window_states.values():
+        if ws.cwd:
+            dirs[ws.cwd] = True
+    return list(dirs.keys())
+
+
+def _short_dir(path: str) -> str:
+    """Abbreviate a directory path for display."""
+    import os
+    path = path.replace(os.path.expanduser("~"), "~")
+    # Shorten Windows OneDrive paths
+    if "/OneDrive" in path and "/Github/" in path:
+        return path.split("/Github/")[-1]
+    if len(path) > 35:
+        return "…/" + Path(path).name
+    return path
+
+
+def _build_lb_message(lb: dict) -> tuple[str, InlineKeyboardMarkup]:
+    """Render the current builder state as text + inline keyboard."""
+    step = lb.get("step", "main")
+    backend = lb.get("backend", "")
+    model = lb.get("model", "")
+    dir_idx = lb.get("dir_idx", -1)
+    known_dirs = lb.get("known_dirs", [])
+    skip_perms = lb.get("skip_perms", True)
+    resume = lb.get("resume", True)
+
+    lines = ["⚙️ *Launch Session Builder*", ""]
+
+    # Show choices made so far
+    if backend:
+        lines.append(f"Backend: `{backend}` ✓")
+    if model:
+        lines.append(f"Model: `{model}` ✓")
+    elif backend:
+        lines.append("Model: `default` ✓")
+    if dir_idx >= 0 and dir_idx < len(known_dirs):
+        lines.append(f"Dir: `{_short_dir(known_dirs[dir_idx])}` ✓")
+
+    buttons: list[list[InlineKeyboardButton]] = []
+
+    if step == "main":
+        # Show saved profiles as quick-launch + custom build
+        lines.append("")
+        lines.append("Quick launch or build custom:")
+        profiles = profile_manager.list_profiles()
+        row: list[InlineKeyboardButton] = []
+        for prof, state in profiles:
+            indicator = "●" if state.window_id else ""
+            label = f"{prof.icon} {prof.name} {indicator}"
+            row.append(InlineKeyboardButton(label, callback_data=f"{CB_LB_PROFILE}{prof.slug}"))
+            if len(row) == 2:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        buttons.append([InlineKeyboardButton("✨ Custom build…", callback_data=f"{CB_LB_BACKEND}pick")])
+
+    elif step == "backend":
+        lines.append("")
+        lines.append("Pick backend:")
+        buttons.append([
+            InlineKeyboardButton("Claude", callback_data=f"{CB_LB_BACKEND}claude"),
+            InlineKeyboardButton("OpenCode", callback_data=f"{CB_LB_BACKEND}opencode"),
+        ])
+
+    elif step == "model":
+        lines.append("")
+        lines.append("Pick model:")
+        if backend == "claude":
+            buttons.append([
+                InlineKeyboardButton("Default", callback_data=f"{CB_LB_MODEL}default"),
+                InlineKeyboardButton("Opus", callback_data=f"{CB_LB_MODEL}opus"),
+            ])
+            buttons.append([
+                InlineKeyboardButton("Sonnet", callback_data=f"{CB_LB_MODEL}sonnet"),
+                InlineKeyboardButton("Haiku", callback_data=f"{CB_LB_MODEL}haiku"),
+            ])
+        else:
+            buttons.append([
+                InlineKeyboardButton("Default", callback_data=f"{CB_LB_MODEL}default"),
+            ])
+
+    elif step == "dir":
+        lines.append("")
+        lines.append("Pick directory:")
+        for i, d in enumerate(known_dirs[:6]):
+            buttons.append([InlineKeyboardButton(
+                f"📂 {_short_dir(d)}",
+                callback_data=f"{CB_LB_DIR}{i}",
+            )])
+
+    elif step == "flags":
+        lines.append("")
+        sp_icon = "✅" if skip_perms else "☐"
+        rs_icon = "✅" if resume else "☐"
+        buttons.append([
+            InlineKeyboardButton(f"{sp_icon} Skip permissions", callback_data=f"{CB_LB_FLAG}skip"),
+            InlineKeyboardButton(f"{rs_icon} Resume last", callback_data=f"{CB_LB_FLAG}resume"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("🚀 Launch!", callback_data=CB_LB_GO),
+        ])
+
+    text = "\n".join(lines)
+    keyboard = InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([])
+    return text, keyboard
+
+
+async def launch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Interactive session launcher — pick backend, model, directory, then go."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    known_dirs = _get_known_dirs()
+
+    lb = {
+        "step": "main",
+        "backend": "",
+        "model": "",
+        "dir_idx": -1,
+        "known_dirs": known_dirs,
+        "skip_perms": True,
+        "resume": True,
+    }
+
+    if context.user_data is not None:
+        context.user_data[_lb_key(thread_id)] = lb
+
+    text, keyboard = _build_lb_message(lb)
+    await safe_reply(update.message, text, reply_markup=keyboard)
+
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """One-shot health check of entire stack."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    summary = await get_status_summary()
+    await safe_reply(update.message, summary)
+
+
+async def ps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show what's running in each tmux window."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    output = await get_ps_output()
+    await safe_reply(update.message, output)
+
+
+async def diag_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Full diagnostic dump of all stack layers."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    output = await get_diag_output()
+    await safe_reply(update.message, output)
+
+
+async def alive_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check if a session's CLI process is still active/writing."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    thread_id = _get_thread_id(update)
+
+    # If in a topic, check that topic's window
+    if thread_id:
+        wid = session_manager.get_window_for_thread(user.id, thread_id)
+        if wid:
+            result = await get_alive_check(wid)
+            await safe_reply(update.message, result)
+            return
+
+    # No topic context — check all active profile windows
+    results = []
+    for slug, state in profile_manager.states.items():
+        if state.window_id:
+            result = await get_alive_check(state.window_id)
+            results.append(result)
+
+    if not results:
+        # Fall back to all windows
+        windows = await tmux_manager.list_windows()
+        for w in windows[:6]:
+            result = await get_alive_check(w.window_id)
+            results.append(result)
+
+    if results:
+        await safe_reply(update.message, "\n\n".join(results))
+    else:
+        await safe_reply(update.message, "No active sessions found.")
+
+
+async def relaunch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Exit and reopen Claude in the same window. Useful for MCP config reloading."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    wid = session_manager.resolve_window_for_thread(user.id, thread_id)
+    if not wid:
+        await safe_reply(update.message, "❌ No session bound to this topic.")
+        return
+
+    # Gather info before killing
+    ws = session_manager.window_states.get(wid)
+    work_dir = ws.cwd if ws else ""
+    session_id = ws.session_id if ws else ""
+    display_name = session_manager.get_display_name(wid)
+
+    # Check if this topic has a profile
+    profile = profile_manager.find_by_topic(thread_id) if thread_id else None
+
+    # Kill the old window
+    w = await tmux_manager.find_window_by_id(wid)
+    if w:
+        await tmux_manager.kill_window(wid)
+
+    # Build the CLI command
+    if profile:
+        cmd_parts = [
+            profile.backend if profile.backend != "claude" else config.claude_command
+        ]
+        if profile.model:
+            cmd_parts.append(f"--model {profile.model}")
+        if profile.flags:
+            cmd_parts.append(profile.flags)
+        if profile.resume and session_id:
+            cmd_parts.append(f"--resume {session_id}")
+        cli_command = " ".join(cmd_parts)
+        work_dir = profile.directory or work_dir
+        window_name = profile.slug
+    else:
+        cmd_parts = [config.claude_command, "--dangerously-skip-permissions"]
+        if session_id:
+            cmd_parts.append(f"--resume {session_id}")
+        cli_command = " ".join(cmd_parts)
+        window_name = display_name or None
+
+    if not work_dir:
+        await safe_reply(update.message, "❌ Cannot determine working directory.")
+        return
+
+    # Create new window
+    success, msg, wname, new_wid = await tmux_manager.create_window(
+        work_dir=work_dir,
+        window_name=window_name,
+        start_claude=False,
+    )
+
+    if not success:
+        await safe_reply(update.message, f"❌ Relaunch failed: {msg}")
+        return
+
+    # Send the CLI command
+    await tmux_manager.send_keys(new_wid, cli_command, enter=True, literal=True)
+
+    # Re-bind the topic to the new window
+    if thread_id:
+        session_manager.unbind_thread(user.id, thread_id)
+        session_manager.bind_thread(user.id, thread_id, new_wid, window_name=window_name)
+        session_manager.window_display_names[new_wid] = display_name or window_name or ""
+        session_manager._save_state()
+
+    # Update profile state
+    if profile:
+        profile_manager.activate(
+            profile.slug, window_id=new_wid, topic_id=thread_id or 0
+        )
+
+    resume_note = " (resuming session)" if session_id else ""
+    await safe_reply(
+        update.message,
+        f"🔄 Relaunched *{display_name or window_name}*{resume_note}\n📂 `{work_dir}`",
+    )
 
 
 async def usage_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1253,6 +1952,341 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             logger.error(f"Failed to refresh screenshot: {e}")
             await query.answer("Failed to refresh", show_alert=True)
 
+    # --- Profile system callbacks ---
+    elif data.startswith(CB_PROFILE_LAUNCH):
+        slug = data[len(CB_PROFILE_LAUNCH):]
+        profile = profile_manager.profiles.get(slug)
+        if not profile:
+            await query.answer("Profile not found", show_alert=True)
+            return
+
+        # Check if already active
+        if profile_manager.is_active(slug):
+            await query.answer("Already active!", show_alert=True)
+            return
+
+        # Check max active limit — suspend least recent if needed
+        if profile_manager.active_count() >= profile_manager.MAX_ACTIVE:
+            lru_slug = profile_manager.least_recent_active()
+            if lru_slug:
+                lru_state = profile_manager.get_state(lru_slug)
+                lru_profile = profile_manager.profiles.get(lru_slug)
+                if lru_state.window_id:
+                    ws = session_manager.window_states.get(lru_state.window_id)
+                    sid = ws.session_id if ws else ""
+                    await tmux_manager.kill_window(lru_state.window_id)
+                    profile_manager.suspend(lru_slug, session_id=sid)
+                    lru_name = lru_profile.name if lru_profile else lru_slug
+                    logger.info("Auto-suspended profile %s to make room", lru_name)
+
+        # Build the CLI command
+        cmd_parts = [
+            profile.backend if profile.backend != "claude" else config.claude_command
+        ]
+        if profile.model:
+            cmd_parts.append(f"--model {profile.model}")
+        if profile.flags:
+            cmd_parts.append(profile.flags)
+
+        # Check if we should resume
+        pstate = profile_manager.get_state(slug)
+        if profile.resume and pstate.last_session_id:
+            cmd_parts.append(f"--resume {pstate.last_session_id}")
+
+        cli_command = " ".join(cmd_parts)
+
+        # Create tmux window
+        success, msg, wname, wid = await tmux_manager.create_window(
+            work_dir=profile.directory,
+            window_name=profile.slug,
+            start_claude=False,
+        )
+
+        if not success:
+            await safe_edit(query, f"❌ Failed to launch: {msg}")
+            await query.answer()
+            return
+
+        # Send the CLI command to the new window
+        await tmux_manager.send_keys(wid, cli_command, enter=True, literal=True)
+
+        # Track in profile state
+        thread_id = _get_thread_id(update)
+        chat = update.effective_chat
+        chat_id = chat.id if chat else 0
+        profile_manager.activate(
+            slug,
+            window_id=wid,
+            topic_id=thread_id or 0,
+            chat_id=chat_id,
+        )
+
+        # Bind the topic to this window if we have a thread
+        if thread_id and user:
+            session_manager.bind_thread(user.id, thread_id, wid, window_name=profile.slug)
+            session_manager.window_display_names[wid] = profile.name
+            session_manager._save_state()
+
+        # Inject system prompt after a delay (let CLI start up)
+        if profile.system_prompt:
+            async def _inject_prompt() -> None:
+                await asyncio.sleep(8)
+                await tmux_manager.send_keys(wid, profile.system_prompt, enter=True, literal=True)
+            asyncio.create_task(_inject_prompt())
+
+        deep_link = profile_manager.get_telegram_deep_link(slug)
+        link_text = f"\n🔗 [Open in Telegram]({deep_link})" if deep_link else ""
+
+        await safe_edit(
+            query,
+            f"{profile.icon} *{profile.name}* launched\n"
+            f"📂 `{profile.directory}`\n"
+            f"⚙️ {profile.backend}"
+            f"{f' ({profile.model})' if profile.model else ''}"
+            f"{link_text}",
+        )
+        await query.answer("Launched!")
+
+    elif data.startswith(CB_PROFILE_SUSPEND):
+        slug = data[len(CB_PROFILE_SUSPEND):]
+        pstate = profile_manager.get_state(slug)
+        profile = profile_manager.profiles.get(slug)
+        if not pstate.window_id:
+            await query.answer("Not active", show_alert=True)
+            return
+
+        ws = session_manager.window_states.get(pstate.window_id)
+        sid = ws.session_id if ws else ""
+
+        await tmux_manager.kill_window(pstate.window_id)
+        profile_manager.suspend(slug, session_id=sid)
+
+        name = profile.name if profile else slug
+        await safe_edit(query, f"💤 *{name}* suspended. Session saved for resume.")
+        await query.answer("Suspended")
+
+    elif data.startswith(CB_PROFILE_INFO):
+        slug = data[len(CB_PROFILE_INFO):]
+        profile = profile_manager.profiles.get(slug)
+        pstate = profile_manager.get_state(slug)
+        if not profile:
+            await query.answer("Profile not found", show_alert=True)
+            return
+
+        is_active = bool(pstate.window_id)
+        status = "● Active" if is_active else "○ Suspended"
+
+        deep_link = profile_manager.get_telegram_deep_link(slug)
+        link_text = f"\n🔗 [Open topic]({deep_link})" if deep_link else ""
+
+        info_text = (
+            f"{profile.icon} *{profile.name}*\n"
+            f"Status: {status}\n"
+            f"📂 `{profile.directory}`\n"
+            f"⚙️ {profile.backend}"
+            f"{f' ({profile.model})' if profile.model else ''}"
+            f"{link_text}"
+        )
+
+        buttons = []
+        if is_active:
+            buttons.append([
+                InlineKeyboardButton("💤 Suspend", callback_data=f"pf:suspend:{slug}"),
+            ])
+        else:
+            buttons.append([
+                InlineKeyboardButton("🚀 Launch", callback_data=f"pf:launch:{slug}"),
+            ])
+
+        keyboard = InlineKeyboardMarkup(buttons) if buttons else None
+        await safe_edit(query, info_text, reply_markup=keyboard)
+        await query.answer()
+
+    # --- Launch builder callbacks ---
+    elif data.startswith("lb:"):
+        thread_id = _get_thread_id(update)
+        key = _lb_key(thread_id)
+        lb = (context.user_data or {}).get(key)
+
+        # Quick-launch a saved profile from the builder menu
+        if data.startswith(CB_LB_PROFILE):
+            slug = data[len(CB_LB_PROFILE):]
+            profile = profile_manager.profiles.get(slug)
+            if not profile:
+                await query.answer("Profile not found", show_alert=True)
+                return
+
+            # Reuse the profile launch logic: build CLI cmd + create window
+            pstate = profile_manager.get_state(slug)
+
+            # If already active, just tell the user
+            if profile_manager.is_active(slug):
+                await safe_edit(query, f"{profile.icon} *{profile.name}* is already active.")
+                await query.answer()
+                return
+
+            # Auto-suspend LRU if at capacity
+            if profile_manager.active_count() >= profile_manager.MAX_ACTIVE:
+                lru_slug = profile_manager.least_recent_active()
+                if lru_slug:
+                    lru_state = profile_manager.get_state(lru_slug)
+                    if lru_state.window_id:
+                        ws = session_manager.window_states.get(lru_state.window_id)
+                        sid = ws.session_id if ws else ""
+                        await tmux_manager.kill_window(lru_state.window_id)
+                        profile_manager.suspend(lru_slug, session_id=sid)
+
+            cmd_parts = [
+                profile.backend if profile.backend != "claude" else config.claude_command
+            ]
+            if profile.model:
+                cmd_parts.append(f"--model {profile.model}")
+            if profile.flags:
+                cmd_parts.append(profile.flags)
+            if profile.resume and pstate.last_session_id:
+                cmd_parts.append(f"--resume {pstate.last_session_id}")
+            cli_command = " ".join(cmd_parts)
+
+            success, msg, wname, wid = await tmux_manager.create_window(
+                work_dir=profile.directory,
+                window_name=profile.slug,
+                start_claude=False,
+            )
+            if not success:
+                await safe_edit(query, f"❌ Failed: {msg}")
+                await query.answer()
+                return
+
+            await tmux_manager.send_keys(wid, cli_command, enter=True, literal=True)
+
+            chat = update.effective_chat
+            chat_id = chat.id if chat else 0
+            profile_manager.activate(slug, window_id=wid, topic_id=thread_id or 0, chat_id=chat_id)
+            if thread_id and user:
+                session_manager.bind_thread(user.id, thread_id, wid, window_name=profile.slug)
+                session_manager.window_display_names[wid] = profile.name
+                session_manager._save_state()
+
+            if profile.system_prompt:
+                async def _inject(w=wid, p=profile.system_prompt) -> None:
+                    await asyncio.sleep(8)
+                    await tmux_manager.send_keys(w, p, enter=True, literal=True)
+                asyncio.create_task(_inject())
+
+            await safe_edit(
+                query,
+                f"{profile.icon} *{profile.name}* launched\n"
+                f"📂 `{_short_dir(profile.directory)}`\n"
+                f"⚙️ {profile.backend}"
+                f"{f' ({profile.model})' if profile.model else ''}",
+            )
+            await query.answer("Launched!")
+            return
+
+        if not lb:
+            # No builder state — start fresh
+            lb = {
+                "step": "main", "backend": "", "model": "", "dir_idx": -1,
+                "known_dirs": _get_known_dirs(), "skip_perms": True, "resume": True,
+            }
+            if context.user_data is not None:
+                context.user_data[key] = lb
+
+        # Step: pick backend
+        if data.startswith(CB_LB_BACKEND):
+            val = data[len(CB_LB_BACKEND):]
+            if val == "pick":
+                lb["step"] = "backend"
+            else:
+                lb["backend"] = val
+                lb["step"] = "model"
+
+        # Step: pick model
+        elif data.startswith(CB_LB_MODEL):
+            val = data[len(CB_LB_MODEL):]
+            lb["model"] = "" if val == "default" else val
+            lb["step"] = "dir"
+
+        # Step: pick directory
+        elif data.startswith(CB_LB_DIR):
+            val = data[len(CB_LB_DIR):]
+            if val == "browse":
+                # TODO: wire into directory browser
+                await query.answer("Browse not yet wired — pick a known dir", show_alert=True)
+                return
+            lb["dir_idx"] = int(val)
+            lb["step"] = "flags"
+
+        # Step: toggle flags
+        elif data.startswith(CB_LB_FLAG):
+            flag = data[len(CB_LB_FLAG):]
+            if flag == "skip":
+                lb["skip_perms"] = not lb.get("skip_perms", True)
+            elif flag == "resume":
+                lb["resume"] = not lb.get("resume", True)
+            # Stay on flags step
+
+        # Launch!
+        elif data == CB_LB_GO:
+            known_dirs = lb.get("known_dirs", [])
+            dir_idx = lb.get("dir_idx", -1)
+            if dir_idx < 0 or dir_idx >= len(known_dirs):
+                await query.answer("Pick a directory first", show_alert=True)
+                return
+
+            backend = lb.get("backend", "claude")
+            model = lb.get("model", "")
+            work_dir = known_dirs[dir_idx]
+            skip_perms = lb.get("skip_perms", True)
+            do_resume = lb.get("resume", True)
+
+            cmd_parts = [
+                backend if backend != "claude" else config.claude_command
+            ]
+            if model:
+                cmd_parts.append(f"--model {model}")
+            if skip_perms:
+                cmd_parts.append("--dangerously-skip-permissions")
+
+            cli_command = " ".join(cmd_parts)
+            dir_name = Path(work_dir).name
+
+            success, msg, wname, wid = await tmux_manager.create_window(
+                work_dir=work_dir,
+                window_name=dir_name,
+                start_claude=False,
+            )
+            if not success:
+                await safe_edit(query, f"❌ Launch failed: {msg}")
+                await query.answer()
+                return
+
+            await tmux_manager.send_keys(wid, cli_command, enter=True, literal=True)
+
+            if thread_id and user:
+                session_manager.bind_thread(user.id, thread_id, wid, window_name=dir_name)
+                session_manager.window_display_names[wid] = dir_name
+                session_manager._save_state()
+
+            model_note = f" ({model})" if model else ""
+            await safe_edit(
+                query,
+                f"🚀 *Launched!*\n"
+                f"📂 `{_short_dir(work_dir)}`\n"
+                f"⚙️ {backend}{model_note}",
+            )
+            await query.answer("Launched!")
+
+            # Clean up builder state
+            if context.user_data is not None:
+                context.user_data.pop(key, None)
+            return
+
+        # Re-render the builder
+        text, keyboard = _build_lb_message(lb)
+        await safe_edit(query, text, reply_markup=keyboard)
+        await query.answer()
+
     elif data == "noop":
         await query.answer()
 
@@ -1464,8 +2498,29 @@ async def handle_new_message(msg: NewMessage, bot: Bot) -> None:
         if get_interactive_msg_id(user_id, thread_id):
             await clear_interactive_msg(user_id, bot, thread_id)
 
-        parts = build_response_parts(
+        # Content filter: decide what's worth showing on Telegram
+        from .content_filter import VerboseLevel, filter_message
+
+        decision = filter_message(
             msg.text,
+            msg.content_type,
+            msg.tool_name,
+            msg.role,
+            VerboseLevel(config.verbose_level),
+        )
+        if decision.action == "suppress":
+            logger.debug(
+                "Filtered [%s/%s]: suppressed (verbose=%d)",
+                msg.content_type,
+                msg.tool_name or "",
+                config.verbose_level,
+            )
+            continue
+
+        display_text = decision.text or msg.text
+
+        parts = build_response_parts(
+            display_text,
             msg.is_complete,
             msg.content_type,
             msg.role,
@@ -1511,13 +2566,25 @@ async def post_init(application: Application) -> None:
     await application.bot.delete_my_commands()
 
     bot_commands = [
+        BotCommand("help", "Command reference — what do I need?"),
         BotCommand("start", "Show welcome message"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
         BotCommand("kill", "Kill session and delete topic"),
         BotCommand("unbind", "Unbind topic from session (keeps window running)"),
+        BotCommand("verbose", "Set verbosity: /verbose 0|1|2"),
+        BotCommand("flush", "Clear message backlog for this topic"),
         BotCommand("usage", "Show Claude Code usage remaining"),
+        BotCommand("launch", "Interactive session launcher"),
+        BotCommand("profiles", "Launch/manage workspace profiles"),
+        BotCommand("status", "Health check of entire stack"),
+        BotCommand("ps", "Show running processes in all windows"),
+        BotCommand("diag", "Full diagnostic dump"),
+        BotCommand("alive", "Check if Claude/OpenCode is still writing"),
+        BotCommand("relaunch", "Exit + reopen Claude (reload MCP configs etc)"),
+        BotCommand("cmds", "Searchable command list: /cmds [search]"),
+        BotCommand("sessionconfig", "Show session/profile config for this topic"),
     ]
     # Add Claude Code slash commands
     for cmd_name, desc in CC_COMMANDS.items():
@@ -1590,12 +2657,24 @@ def create_bot() -> Application:
         .build()
     )
 
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cmds", cmds_command))
+    application.add_handler(CommandHandler("sessionconfig", sessionconfig_command))
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
+    application.add_handler(CommandHandler("verbose", verbose_command))
+    application.add_handler(CommandHandler("flush", flush_command))
     application.add_handler(CommandHandler("usage", usage_command))
+    application.add_handler(CommandHandler("profiles", profiles_command))
+    application.add_handler(CommandHandler("launch", launch_command))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("ps", ps_command))
+    application.add_handler(CommandHandler("diag", diag_command))
+    application.add_handler(CommandHandler("alive", alive_command))
+    application.add_handler(CommandHandler("relaunch", relaunch_command))
     application.add_handler(CallbackQueryHandler(callback_handler))
     # Topic closed event — auto-kill associated window
     application.add_handler(
