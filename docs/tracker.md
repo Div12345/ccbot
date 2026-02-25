@@ -14,14 +14,15 @@
 - [x] Session monitor rate limiting — sliding window 20 msg/60s in message_queue.py
 - [x] Removed DEBUG_UPDATE handler (was temporary diagnostic)
 - [x] Thread auto-binding — [Resume] inside thread binds it to project
-- [x] In-thread text routing — already existed, needed bindings (now auto-bound)
+- [x] In-thread text routing — already existed, now auto-bound via [Resume]
 - [x] /c natural text — main area text already routes to concierge
 - [x] AIORateLimiter capped — max_retries=2, overall_max_rate=20/60s
+- [x] Session monitor batching — combine events per poll cycle (~10-50x reduction)
+- [x] Commit + push all new modules
 
 ## Next Up
-- [ ] Session monitor batching — combine events, cap messages/min
 - [ ] Thread cleanup — close orphan threads via /threads buttons
-- [ ] Commit + push all new modules (discovery, state, concierge, bot changes)
+- [ ] Update .env with Opencode_job_bot token (hook blocks edit)
 
 ## Future (after basics work)
 - [ ] Agent-assisted setup (concierge uses cheap model for intelligence)
