@@ -156,8 +156,9 @@ async def get_status_summary() -> str:
     from .handlers.message_queue import get_message_queue
     total_queued = 0
     for uid in list(session_manager.thread_bindings.keys()):
-        q, _ = get_message_queue(uid)
-        total_queued += q.qsize()
+        q = get_message_queue(uid)
+        if q:
+            total_queued += q.qsize()
     if total_queued > 0:
         lines.append(f"📬 Queue: {total_queued} messages pending")
     else:

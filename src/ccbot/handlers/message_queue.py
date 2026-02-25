@@ -73,6 +73,27 @@ _flood_until: dict[int, float] = {}
 # Max seconds to wait for flood control before dropping tasks
 FLOOD_CONTROL_MAX_WAIT = 10
 
+# Proactive rate limiting: prevent hitting Telegram's flood limits
+# Telegram allows ~30 msg/sec to same chat, but sustained load triggers bans.
+# We cap at 20 messages per 60 seconds per user to stay safe.
+RATE_LIMIT_WINDOW = 60.0  # seconds
+RATE_LIMIT_MAX = 20  # max messages per window
+_send_timestamps: dict[int, list[float]] = {}  # user_id -> list of send times
+
+
+def _check_rate_limit(user_id: int) -> bool:
+    """Check if user is within rate limit. Returns True if OK to send."""
+    now = time.monotonic()
+    timestamps = _send_timestamps.setdefault(user_id, [])
+    # Prune old timestamps
+    cutoff = now - RATE_LIMIT_WINDOW
+    _send_timestamps[user_id] = [t for t in timestamps if t > cutoff]
+    timestamps = _send_timestamps[user_id]
+    if len(timestamps) >= RATE_LIMIT_MAX:
+        return False
+    timestamps.append(now)
+    return True
+
 
 def get_message_queue(user_id: int) -> asyncio.Queue[MessageTask] | None:
     """Get the message queue for a user (if exists)."""
@@ -640,6 +661,9 @@ async def enqueue_content_message(
         window_id,
         content_type,
     )
+    if not _check_rate_limit(user_id):
+        logger.warning("Rate limit: dropping content message for user %d (>%d/min)", user_id, RATE_LIMIT_MAX)
+        return
     queue = get_or_create_queue(bot, user_id)
 
     task = MessageTask(
