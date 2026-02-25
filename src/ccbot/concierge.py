@@ -25,6 +25,7 @@ from .state import (
     set_project,
 )
 from .discovery import scan_backends, scan_models, scan_sessions
+from .profiles import ProfileManager
 
 logger = logging.getLogger(__name__)
 
@@ -252,7 +253,9 @@ def _ask_confirm(chat_id: int) -> Response:
 # ---------------------------------------------------------------------------
 
 
-def _launch_session(name: str, backend: str, model: str, cwd: str) -> tuple[bool, str]:
+def _launch_session(
+    name: str, backend: str, model: str, cwd: str, flags: str = ""
+) -> tuple[bool, str]:
     """Create a tmux window and start the backend. Returns (ok, message)."""
     from .config import config  # import here to avoid circulars
 
@@ -281,9 +284,15 @@ def _launch_session(name: str, backend: str, model: str, cwd: str) -> tuple[bool
     target = f"{session}:{name}"
 
     if backend == "claude":
-        cmd = f"claude" + (f" --model {model}" if model and model != "default" else "")
+        cmd = "claude"
+        if model and model != "default":
+            cmd += f" --model {model}"
+        if flags:
+            cmd += f" {flags}"
     else:
-        cmd = f"opencode" + (f" -m {model}" if model and model != "default" else "")
+        cmd = "opencode"
+        if model and model != "default":
+            cmd += f" -m {model}"
 
     subprocess.run(
         ["tmux", "send-keys", "-t", target, cmd, "Enter"],
@@ -511,12 +520,35 @@ def handle_action(action: str) -> Response:
     # New session for a named project
     # ------------------------------------------------------------------ #
     if verb == "new":
-        # arg is the project name; we'd need chat_id to run wizard.
-        # Return a cue. The bot layer must call handle("new session", chat_id)
-        # and carry the name forward.
+        # Use profile to pre-fill and launch directly
+        pm = ProfileManager()
+        profile = pm.get(arg)
+        if profile and profile.directory:
+            ok, msg = _launch_session(
+                arg, profile.backend, profile.model, profile.directory,
+                flags=profile.flags,
+            )
+            if ok and profile.system_prompt:
+                # Send system prompt after a short delay
+                from .config import config as _cfg
+                import time
+                time.sleep(1)
+                target = f"{_cfg.tmux_session_name}:{arg}"
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", target, profile.system_prompt, "Enter"],
+                    capture_output=True,
+                )
+                msg += f"\n_System prompt injected._"
+            return Response(
+                type="action_result",
+                text=msg,
+                buttons=[[Button("Status", "cc:status")]],
+                project=arg,
+            )
+        # No profile or no directory — fall through to wizard
         return Response(
             type="question",
-            text=f"Send `new session` to configure a session for *{arg}*.",
+            text=f"No profile found for *{arg}*. Send `new session` to configure.",
             buttons=[],
             project=arg,
         )
