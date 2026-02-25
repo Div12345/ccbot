@@ -56,6 +56,15 @@ from telegram.ext import (
 )
 
 from .config import config
+from .concierge import (
+    handle as concierge_handle,
+    handle_action as concierge_action,
+    wizard_select_backend,
+    wizard_select_model,
+    wizard_select_dir,
+    wizard_go,
+    Response as ConciergeResponse,
+)
 from .diagnostics import get_status_summary, get_ps_output, get_diag_output, get_alive_check
 from .profiles import profile_manager
 from .handlers.callback_data import (
@@ -247,6 +256,29 @@ CCBOT_COMMAND_CATEGORIES: dict[str, list[tuple[str, str]]] = {
 
 def is_user_allowed(user_id: int | None) -> bool:
     return user_id is not None and config.is_user_allowed(user_id)
+
+
+async def _send_concierge_response(resp: ConciergeResponse, update_or_message, context) -> None:
+    """Render a concierge Response as a Telegram message with inline keyboard."""
+    keyboard = []
+    for row in resp.buttons:
+        keyboard.append([
+            InlineKeyboardButton(btn.label, callback_data=btn.data)
+            for btn in row
+        ])
+    markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+
+    # Handle both Update objects and Message objects
+    if hasattr(update_or_message, 'effective_message'):
+        msg = update_or_message.effective_message
+    else:
+        msg = update_or_message
+
+    await msg.reply_text(
+        resp.text,
+        parse_mode="Markdown",
+        reply_markup=markup,
+    )
 
 
 def _get_thread_id(update: Update) -> int | None:
@@ -974,14 +1006,100 @@ async def launch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """One-shot health check of entire stack."""
+    """Interactive status via concierge with actionable buttons."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
 
     await update.message.chat.send_action(ChatAction.TYPING)
-    summary = await get_status_summary()
-    await safe_reply(update.message, summary)
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    resp = concierge_handle("status", chat_id=chat_id)
+    if resp:
+        await _send_concierge_response(resp, update, context)
+    else:
+        # Fallback to old summary
+        summary = await get_status_summary()
+        await safe_reply(update.message, summary)
+
+
+async def concierge_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Concierge entry point: /c <anything> routes to the setup concierge.
+
+    Examples: /c status, /c arterial, /c new session, /c (defaults to status)
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    text = (update.message.text or "").split(None, 1)
+    query = text[1] if len(text) > 1 else "status"
+    resp = concierge_handle(query, chat_id=chat_id)
+    if resp:
+        await _send_concierge_response(resp, update, context)
+    else:
+        await safe_reply(update.message, "Concierge didn't understand that.")
+
+
+async def threads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List and manage Telegram forum threads.
+
+    Shows all known threads, their binding status, and offers cleanup actions.
+    """
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+
+    logger.warning("threads_command: ENTERED handler")
+    try:
+        await update.message.chat.send_action(ChatAction.TYPING)
+        from .state import list_projects
+
+        projects = list_projects()
+        logger.warning("threads_command: got %d projects", len(projects))
+        lines = ["*Forum Threads*\n"]
+        buttons = []
+
+        # Threads bound to projects
+        for p in projects:
+            if p.thread_id:
+                status = "live" if p.alive else "off"
+                lines.append(f"• *{p.name}* (thread {p.thread_id}) — [{status}]")
+            else:
+                lines.append(f"• *{p.name}* — no thread")
+
+        # Known display names that aren't in projects (orphan threads)
+        project_threads = {p.thread_id for p in projects if p.thread_id}
+        known_bindings = {}
+        for uid, tid, wid in session_manager.iter_thread_bindings():
+            if tid not in project_threads:
+                display = session_manager.get_display_name(wid)
+                known_bindings[tid] = (display, wid)
+
+        if known_bindings:
+            lines.append("\n*Unbound/orphan threads:*")
+            for tid, (display, wid) in known_bindings.items():
+                lines.append(f"• {display} (thread {tid}) — orphan")
+                buttons.append([
+                    InlineKeyboardButton(f"Close {display}", callback_data=f"cc:close_thread:{tid}"),
+                ])
+
+        # Also show display names with no thread binding (stale window records)
+        if not known_bindings and not any(p.thread_id for p in projects):
+            lines.append("\nNo thread bindings found.")
+
+        from telegram import InlineKeyboardMarkup
+        markup = InlineKeyboardMarkup(buttons) if buttons else None
+        logger.warning("threads_command: sending reply: %s", "\n".join(lines)[:200])
+        await safe_reply(update.message, "\n".join(lines), reply_markup=markup)
+        logger.warning("threads_command: reply sent OK")
+    except Exception as e:
+        logger.error("threads_command FAILED: %s", e, exc_info=True)
+        try:
+            await safe_reply(update.message, f"❌ /threads error: {e}")
+        except Exception:
+            pass
 
 
 async def ps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1561,8 +1679,13 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         context.user_data.pop("_pending_thread_id", None)
         context.user_data.pop("_pending_thread_text", None)
 
-    # Must be in a named topic
+    # Main thread (no topic) — route to concierge
     if thread_id is None:
+        chat_id = update.effective_chat.id if update.effective_chat else 0
+        resp = concierge_handle(text, chat_id=chat_id, thread_id=thread_id)
+        if resp:
+            await _send_concierge_response(resp, update, context)
+            return
         await safe_reply(
             update.message,
             "❌ Please use a named topic. Create a new topic to start a session.",
@@ -1687,6 +1810,93 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     chat = update.effective_chat
     if chat and chat.type in ("group", "supergroup"):
         session_manager.set_group_chat_id(user.id, cb_thread_id, chat.id)
+
+    # Concierge callbacks (cc:action:target)
+    if data.startswith("cc:"):
+        chat_id = chat.id if chat else 0
+        parts = data.split(":", 2)
+        action = parts[1] if len(parts) > 1 else ""
+        value = parts[2] if len(parts) > 2 else ""
+
+        if action == "close_thread":
+            # Close a forum topic — Telegram-specific, handled here not in concierge
+            try:
+                tid = int(value)
+                close_chat = session_manager.resolve_chat_id(user.id, tid)
+                await context.bot.close_forum_topic(chat_id=close_chat, message_thread_id=tid)
+                # Unbind if bound
+                session_manager.unbind_thread(user.id, tid)
+                await query.answer("Thread closed")
+                await query.message.reply_text(f"✓ Thread {tid} closed")
+            except Exception as e:
+                await query.answer(f"Failed: {e}")
+            return
+
+        if action == "backend":
+            resp = wizard_select_backend(chat_id, value)
+        elif action == "model":
+            resp = wizard_select_model(chat_id, value)
+        elif action == "dir":
+            idx = int(value) if value.isdigit() else 0
+            resp = wizard_select_dir(chat_id, idx)
+        elif action == "go":
+            resp = wizard_go(chat_id)
+        else:
+            resp = concierge_action(data)
+
+        if resp:
+            await query.answer()
+            await _send_concierge_response(resp, query.message, context)
+
+            # Auto-bind: if button pressed inside a thread, bind it to the project
+            if (
+                cb_thread_id
+                and resp.project
+                and resp.type == "action_result"
+                and action in ("resume", "relaunch", "fresh")
+            ):
+                from .state import get as _get_proj
+                proj = _get_proj(resp.project)
+                if proj and proj.window_id:
+                    existing = session_manager.get_window_for_thread(user.id, cb_thread_id)
+                    if existing != proj.window_id:
+                        session_manager.bind_thread(
+                            user.id, cb_thread_id, proj.window_id, resp.project
+                        )
+                        logger.info(
+                            "Auto-bound thread %d -> %s (%s)",
+                            cb_thread_id, proj.window_id, resp.project,
+                        )
+                        try:
+                            await query.message.reply_text(
+                                f"🔗 Thread bound to *{resp.project}*",
+                                parse_mode="Markdown",
+                            )
+                        except Exception:
+                            pass
+
+            # After successful session action, notify the project's bound thread
+            if resp.project and resp.type == "action_result" and action in (
+                "resume", "relaunch", "fresh",
+            ):
+                from .state import get as _get_proj
+                proj = _get_proj(resp.project)
+                if proj and proj.thread_id and proj.thread_id != cb_thread_id:
+                    try:
+                        notify_chat = session_manager.resolve_chat_id(
+                            user.id, proj.thread_id
+                        )
+                        await context.bot.send_message(
+                            chat_id=notify_chat,
+                            message_thread_id=proj.thread_id,
+                            text=f"✓ *{resp.project}* session is live",
+                            parse_mode="Markdown",
+                        )
+                    except Exception as e:
+                        logger.debug("Thread notify failed: %s", e)
+        else:
+            await query.answer("Unknown action")
+        return
 
     # History: older/newer pagination
     # Format: hp:<page>:<window_id>:<start>:<end> or hn:<page>:<window_id>:<start>:<end>
@@ -2804,7 +3014,7 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter(max_retries=5))
+        .rate_limiter(AIORateLimiter(max_retries=2, overall_max_rate=20, overall_time_period=60))
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -2824,6 +3034,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("profiles", profiles_command))
     application.add_handler(CommandHandler("launch", launch_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("c", concierge_command))
+    application.add_handler(CommandHandler("threads", threads_command))
     application.add_handler(CommandHandler("ps", ps_command))
     application.add_handler(CommandHandler("diag", diag_command))
     application.add_handler(CommandHandler("alive", alive_command))
