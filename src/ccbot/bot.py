@@ -59,13 +59,19 @@ from .config import config
 from .concierge import (
     handle as concierge_handle,
     handle_action as concierge_action,
+    wizard_start_for_project,
     wizard_select_backend,
     wizard_select_model,
     wizard_select_dir,
     wizard_go,
     Response as ConciergeResponse,
 )
-from .diagnostics import get_status_summary, get_ps_output, get_diag_output, get_alive_check
+from .diagnostics import (
+    get_status_summary,
+    get_ps_output,
+    get_diag_output,
+    get_alive_check,
+)
 from .profiles import profile_manager
 from .handlers.callback_data import (
     CB_ASK_DOWN,
@@ -230,10 +236,13 @@ CCBOT_COMMAND_CATEGORIES: dict[str, list[tuple[str, str]]] = {
         ("/status", "Health check of entire stack"),
         ("/alive", "Is Claude still writing?"),
         ("/ps", "All tmux windows + processes"),
+        ("/threads", "List all topic bindings"),
         ("/diag", "Full diagnostic dump"),
         ("/usage", "Quota remaining"),
     ],
     "Workspaces": [
+        ("/new", "Start a new session in this topic"),
+        ("/bind", "Bind this topic to an existing window"),
         ("/launch", "Interactive session launcher (pick backend/model/dir)"),
         ("/profiles", "Launch/suspend workspace profiles"),
         ("/screenshot", "Terminal screenshot + controls"),
@@ -258,18 +267,19 @@ def is_user_allowed(user_id: int | None) -> bool:
     return user_id is not None and config.is_user_allowed(user_id)
 
 
-async def _send_concierge_response(resp: ConciergeResponse, update_or_message, context) -> None:
+async def _send_concierge_response(
+    resp: ConciergeResponse, update_or_message, context
+) -> None:
     """Render a concierge Response as a Telegram message with inline keyboard."""
     keyboard = []
     for row in resp.buttons:
-        keyboard.append([
-            InlineKeyboardButton(btn.label, callback_data=btn.data)
-            for btn in row
-        ])
+        keyboard.append(
+            [InlineKeyboardButton(btn.label, callback_data=btn.data) for btn in row]
+        )
     markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
     # Handle both Update objects and Message objects
-    if hasattr(update_or_message, 'effective_message'):
+    if hasattr(update_or_message, "effective_message"):
         msg = update_or_message.effective_message
     else:
         msg = update_or_message
@@ -332,7 +342,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "  /usage — Claude Code quota remaining\n"
         "\n"
         "*Workspaces:*\n"
+        "  /new — start a new session in this topic\n"
+        "  /bind — bind this topic to an existing tmux window\n"
         "  /profiles — launch/suspend/manage saved workspaces\n"
+        "  /launch — custom launcher (backend/model/directory)\n"
         "  /screenshot — see the terminal + control keys\n"
         "  /history — message history for this topic\n"
         "\n"
@@ -347,7 +360,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "  Slow/no messages? → /alive then /flush\n"
         "  Backlog flooding? → /flush then /verbose 0\n"
         "  Something broken? → /diag\n"
-        "  Start a workspace? → /profiles\n"
+        "  Start a workspace? → /new or /profiles\n"
         "  Need fresh session? → create a new topic\n"
         "\n"
         "Any /slash command not listed here gets forwarded to Claude Code."
@@ -372,11 +385,13 @@ async def cmds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     lines = []
 
     if search:
-        lines.append(f"*Commands matching \"{search}\":*\n")
+        lines.append(f'*Commands matching "{search}":*\n')
         found = False
         # Search CCBot commands
         for cat, cmds in CCBOT_COMMAND_CATEGORIES.items():
-            matches = [(c, d) for c, d in cmds if search in c.lower() or search in d.lower()]
+            matches = [
+                (c, d) for c, d in cmds if search in c.lower() or search in d.lower()
+            ]
             if matches:
                 found = True
                 lines.append(f"*{cat}* (ccbot):")
@@ -385,7 +400,9 @@ async def cmds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 lines.append("")
         # Search CC commands
         for cat, cmds in CC_COMMAND_CATEGORIES.items():
-            matches = [(c, d) for c, d in cmds if search in c.lower() or search in d.lower()]
+            matches = [
+                (c, d) for c, d in cmds if search in c.lower() or search in d.lower()
+            ]
             if matches:
                 found = True
                 lines.append(f"*{cat}* (↗ Claude Code):")
@@ -413,7 +430,9 @@ async def cmds_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await safe_reply(update.message, "\n".join(lines))
 
 
-async def sessionconfig_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def sessionconfig_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
     """Show current session/profile configuration for this topic."""
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
@@ -441,7 +460,7 @@ async def sessionconfig_command(update: Update, context: ContextTypes.DEFAULT_TY
         lines.append(f"  Resume: {'yes' if profile.resume else 'no'}")
         lines.append(f"  Max idle: {profile.max_idle_minutes}m")
         if profile.system_prompt:
-            prompt_preview = profile.system_prompt[:80].replace('\n', ' ')
+            prompt_preview = profile.system_prompt[:80].replace("\n", " ")
             lines.append(f"  Prompt: _{prompt_preview}..._")
         if profile.obsidian_note:
             lines.append(f"  Obsidian: `{profile.obsidian_note}`")
@@ -569,8 +588,79 @@ async def unbind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         update.message,
         f"✅ Topic unbound from window '{display}'.\n"
         "The Claude session is still running in tmux.\n"
-        "Send a message to bind to a new session.",
+        "Use /bind to attach to an existing window, or /new to start a fresh one.",
     )
+
+
+async def bind_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bind this topic to an existing unbound tmux window."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    existing = session_manager.get_window_for_thread(user.id, thread_id)
+    if existing:
+        display = session_manager.get_display_name(existing)
+        await safe_reply(
+            update.message,
+            f"ℹ️ This topic is already bound to `{display}`. Use /unbind first.",
+        )
+        return
+
+    all_windows = await tmux_manager.list_windows()
+    bound_ids = {wid for _, _, wid in session_manager.iter_thread_bindings()}
+    unbound = [
+        (w.window_id, w.window_name, w.cwd)
+        for w in all_windows
+        if w.window_id not in bound_ids
+    ]
+
+    if not unbound:
+        await safe_reply(
+            update.message,
+            "No unbound windows found. Use /new to start a fresh session.",
+        )
+        return
+
+    msg_text, keyboard, win_ids = build_window_picker(unbound)
+    if context.user_data is not None:
+        context.user_data[STATE_KEY] = STATE_SELECTING_WINDOW
+        context.user_data[UNBOUND_WINDOWS_KEY] = win_ids
+        context.user_data["_pending_thread_id"] = thread_id
+        context.user_data.pop("_pending_thread_text", None)
+    await safe_reply(update.message, msg_text, reply_markup=keyboard)
+
+
+async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias for /launch with topic-friendly wording."""
+    user = update.effective_user
+    if not user or not is_user_allowed(user.id):
+        return
+    if not update.message:
+        return
+
+    thread_id = _get_thread_id(update)
+    if thread_id is None:
+        await safe_reply(update.message, "❌ This command only works in a topic.")
+        return
+
+    existing = session_manager.get_window_for_thread(user.id, thread_id)
+    if existing:
+        display = session_manager.get_display_name(existing)
+        await safe_reply(
+            update.message,
+            f"ℹ️ This topic is already bound to `{display}`.\nUse /unbind first, or just send messages here.",
+        )
+        return
+
+    await launch_command(update, context)
 
 
 async def esc_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -607,7 +697,11 @@ async def verbose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     args = (update.message.text or "").split()
-    labels = {0: "Quiet (text only)", 1: "Normal (tool icons)", 2: "Verbose (everything)"}
+    labels = {
+        0: "Quiet (text only)",
+        1: "Normal (tool icons)",
+        2: "Verbose (everything)",
+    }
 
     if len(args) > 1 and args[1] in ("0", "1", "2"):
         config.verbose_level = int(args[1])
@@ -696,7 +790,9 @@ async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         is_active = bool(state.window_id)
         indicator = "●" if is_active else "○"
         label = f"{profile.icon} {profile.name} {indicator}"
-        callback = f"pf:launch:{profile.slug}" if not is_active else f"pf:info:{profile.slug}"
+        callback = (
+            f"pf:launch:{profile.slug}" if not is_active else f"pf:info:{profile.slug}"
+        )
         row.append(InlineKeyboardButton(label, callback_data=callback))
         if len(row) == 2:
             buttons.append(row)
@@ -717,6 +813,7 @@ async def profiles_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 # --- Launch builder helpers ---
+
 
 def _lb_key(thread_id: int | None) -> str:
     """User-data key for the launch builder state."""
@@ -749,16 +846,18 @@ def _discover_models(backend: str) -> dict:
     result: dict[str, list] = {"providers": []}
 
     if backend == "claude":
-        result["providers"].append({
-            "id": "claude",
-            "name": "Claude Code",
-            "models": [
-                {"id": "default", "name": "Default"},
-                {"id": "opus", "name": "Opus (strongest)"},
-                {"id": "sonnet", "name": "Sonnet (balanced)"},
-                {"id": "haiku", "name": "Haiku (fast)"},
-            ],
-        })
+        result["providers"].append(
+            {
+                "id": "claude",
+                "name": "Claude Code",
+                "models": [
+                    {"id": "default", "name": "Default"},
+                    {"id": "opus", "name": "Opus (strongest)"},
+                    {"id": "sonnet", "name": "Sonnet (balanced)"},
+                    {"id": "haiku", "name": "Haiku (fast)"},
+                ],
+            }
+        )
 
     elif backend == "opencode":
         # 1. Custom models from opencode.json config (user-configured)
@@ -776,17 +875,21 @@ def _discover_models(backend: str) -> dict:
                 pass
 
         if custom_models:
-            result["providers"].append({
-                "id": "_custom",
-                "name": "⭐ Configured",
-                "models": [{"id": "default", "name": "Default"}] + custom_models,
-            })
+            result["providers"].append(
+                {
+                    "id": "_custom",
+                    "name": "⭐ Configured",
+                    "models": [{"id": "default", "name": "Default"}] + custom_models,
+                }
+            )
 
         # 2. Live models from `opencode models`
         try:
             proc = subprocess.run(
                 ["opencode", "models"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             if proc.returncode == 0:
                 grouped: dict[str, list[dict]] = {}
@@ -801,21 +904,25 @@ def _discover_models(backend: str) -> dict:
                     )
                 # Add each provider group
                 for prov_id, models in sorted(grouped.items()):
-                    result["providers"].append({
-                        "id": prov_id,
-                        "name": prov_id.title(),
-                        "models": models,
-                    })
+                    result["providers"].append(
+                        {
+                            "id": prov_id,
+                            "name": prov_id.title(),
+                            "models": models,
+                        }
+                    )
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
 
         # Ensure at least a default
         if not result["providers"]:
-            result["providers"].append({
-                "id": "_default",
-                "name": "OpenCode",
-                "models": [{"id": "default", "name": "Default"}],
-            })
+            result["providers"].append(
+                {
+                    "id": "_default",
+                    "name": "OpenCode",
+                    "models": [{"id": "default", "name": "Default"}],
+                }
+            )
 
     return result
 
@@ -835,6 +942,7 @@ def _get_known_dirs() -> list[str]:
 def _short_dir(path: str) -> str:
     """Abbreviate a directory path for display."""
     import os
+
     path = path.replace(os.path.expanduser("~"), "~")
     # Shorten Windows OneDrive paths
     if "/OneDrive" in path and "/Github/" in path:
@@ -883,13 +991,21 @@ def _build_lb_message(lb: dict) -> tuple[str, InlineKeyboardMarkup]:
         for prof, state in profiles:
             indicator = "●" if state.window_id else ""
             label = f"{prof.icon} {prof.name} {indicator}"
-            row.append(InlineKeyboardButton(label, callback_data=f"{CB_LB_PROFILE}{prof.slug}"))
+            row.append(
+                InlineKeyboardButton(label, callback_data=f"{CB_LB_PROFILE}{prof.slug}")
+            )
             if len(row) == 2:
                 buttons.append(row)
                 row = []
         if row:
             buttons.append(row)
-        buttons.append([InlineKeyboardButton("✨ Custom build…", callback_data=f"{CB_LB_BACKEND}pick")])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "✨ Custom build…", callback_data=f"{CB_LB_BACKEND}pick"
+                )
+            ]
+        )
 
     elif step == "backend":
         lines.append("")
@@ -901,7 +1017,11 @@ def _build_lb_message(lb: dict) -> tuple[str, InlineKeyboardMarkup]:
             row = []
             for b in backends:
                 label = f"{b['icon']} {b['name']}"
-                row.append(InlineKeyboardButton(label, callback_data=f"{CB_LB_BACKEND}{b['id']}"))
+                row.append(
+                    InlineKeyboardButton(
+                        label, callback_data=f"{CB_LB_BACKEND}{b['id']}"
+                    )
+                )
                 if len(row) == 2:
                     buttons.append(row)
                     row = []
@@ -934,7 +1054,9 @@ def _build_lb_message(lb: dict) -> tuple[str, InlineKeyboardMarkup]:
                 label = m["name"]
                 if len(label) > 28:
                     label = label[:25] + "…"
-                row.append(InlineKeyboardButton(label, callback_data=f"{CB_LB_MODEL}{m['id']}"))
+                row.append(
+                    InlineKeyboardButton(label, callback_data=f"{CB_LB_MODEL}{m['id']}")
+                )
                 if len(row) == 2:
                     buttons.append(row)
                     row = []
@@ -942,35 +1064,59 @@ def _build_lb_message(lb: dict) -> tuple[str, InlineKeyboardMarkup]:
                 buttons.append(row)
             # Back to provider list if multiple providers
             if len(providers) > 1:
-                buttons.append([InlineKeyboardButton("← Other providers", callback_data=f"{CB_LB_MODEL}@back")])
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            "← Other providers", callback_data=f"{CB_LB_MODEL}@back"
+                        )
+                    ]
+                )
         else:
             # Multiple providers — show provider picker
             lines.append(f"Pick provider ({len(providers)} available):")
             for p in providers:
                 count = len(p.get("models", []))
                 label = f"{p['name']} ({count})"
-                buttons.append([InlineKeyboardButton(label, callback_data=f"{CB_LB_MODEL}@{p['id']}")])
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            label, callback_data=f"{CB_LB_MODEL}@{p['id']}"
+                        )
+                    ]
+                )
 
     elif step == "dir":
         lines.append("")
         lines.append("Pick directory:")
         for i, d in enumerate(known_dirs[:8]):
-            buttons.append([InlineKeyboardButton(
-                f"📂 {_short_dir(d)}",
-                callback_data=f"{CB_LB_DIR}{i}",
-            )])
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        f"📂 {_short_dir(d)}",
+                        callback_data=f"{CB_LB_DIR}{i}",
+                    )
+                ]
+            )
 
     elif step == "flags":
         lines.append("")
         sp_icon = "✅" if skip_perms else "☐"
         rs_icon = "✅" if resume else "☐"
-        buttons.append([
-            InlineKeyboardButton(f"{sp_icon} Skip permissions", callback_data=f"{CB_LB_FLAG}skip"),
-            InlineKeyboardButton(f"{rs_icon} Resume last", callback_data=f"{CB_LB_FLAG}resume"),
-        ])
-        buttons.append([
-            InlineKeyboardButton("🚀 Launch!", callback_data=CB_LB_GO),
-        ])
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"{sp_icon} Skip permissions", callback_data=f"{CB_LB_FLAG}skip"
+                ),
+                InlineKeyboardButton(
+                    f"{rs_icon} Resume last", callback_data=f"{CB_LB_FLAG}resume"
+                ),
+            ]
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton("🚀 Launch!", callback_data=CB_LB_GO),
+            ]
+        )
 
     text = "\n".join(lines)
     keyboard = InlineKeyboardMarkup(buttons) if buttons else InlineKeyboardMarkup([])
@@ -1050,6 +1196,8 @@ async def threads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     if not user or not is_user_allowed(user.id):
         return
+    if not update.message:
+        return
 
     logger.warning("threads_command: ENTERED handler")
     try:
@@ -1081,15 +1229,20 @@ async def threads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             lines.append("\n*Unbound/orphan threads:*")
             for tid, (display, wid) in known_bindings.items():
                 lines.append(f"• {display} (thread {tid}) — orphan")
-                buttons.append([
-                    InlineKeyboardButton(f"Close {display}", callback_data=f"cc:close_thread:{tid}"),
-                ])
+                buttons.append(
+                    [
+                        InlineKeyboardButton(
+                            f"Close {display}", callback_data=f"cc:close_thread:{tid}"
+                        ),
+                    ]
+                )
 
         # Also show display names with no thread binding (stale window records)
         if not known_bindings and not any(p.thread_id for p in projects):
             lines.append("\nNo thread bindings found.")
 
         from telegram import InlineKeyboardMarkup
+
         markup = InlineKeyboardMarkup(buttons) if buttons else None
         logger.warning("threads_command: sending reply: %s", "\n".join(lines)[:200])
         await safe_reply(update.message, "\n".join(lines), reply_markup=markup)
@@ -1230,8 +1383,12 @@ async def relaunch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     # Re-bind the topic to the new window
     if thread_id:
         session_manager.unbind_thread(user.id, thread_id)
-        session_manager.bind_thread(user.id, thread_id, new_wid, window_name=window_name)
-        session_manager.window_display_names[new_wid] = display_name or window_name or ""
+        session_manager.bind_thread(
+            user.id, thread_id, new_wid, window_name=window_name
+        )
+        session_manager.window_display_names[new_wid] = (
+            display_name or window_name or ""
+        )
         session_manager._save_state()
 
     # Update profile state
@@ -1823,7 +1980,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             try:
                 tid = int(value)
                 close_chat = session_manager.resolve_chat_id(user.id, tid)
-                await context.bot.close_forum_topic(chat_id=close_chat, message_thread_id=tid)
+                await context.bot.close_forum_topic(
+                    chat_id=close_chat, message_thread_id=tid
+                )
                 # Unbind if bound
                 session_manager.unbind_thread(user.id, tid)
                 await query.answer("Thread closed")
@@ -1832,7 +1991,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 await query.answer(f"Failed: {e}")
             return
 
-        if action == "backend":
+        if action == "new" and value:
+            resp = wizard_start_for_project(chat_id, value)
+        elif action == "backend":
             resp = wizard_select_backend(chat_id, value)
         elif action == "model":
             resp = wizard_select_model(chat_id, value)
@@ -1856,16 +2017,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 and action in ("resume", "relaunch", "fresh")
             ):
                 from .state import get as _get_proj
+
                 proj = _get_proj(resp.project)
                 if proj and proj.window_id:
-                    existing = session_manager.get_window_for_thread(user.id, cb_thread_id)
+                    existing = session_manager.get_window_for_thread(
+                        user.id, cb_thread_id
+                    )
                     if existing != proj.window_id:
                         session_manager.bind_thread(
                             user.id, cb_thread_id, proj.window_id, resp.project
                         )
                         logger.info(
                             "Auto-bound thread %d -> %s (%s)",
-                            cb_thread_id, proj.window_id, resp.project,
+                            cb_thread_id,
+                            proj.window_id,
+                            resp.project,
                         )
                         try:
                             await query.message.reply_text(
@@ -1876,10 +2042,18 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                             pass
 
             # After successful session action, notify the project's bound thread
-            if resp.project and resp.type == "action_result" and action in (
-                "resume", "relaunch", "fresh",
+            if (
+                resp.project
+                and resp.type == "action_result"
+                and action
+                in (
+                    "resume",
+                    "relaunch",
+                    "fresh",
+                )
             ):
                 from .state import get as _get_proj
+
                 proj = _get_proj(resp.project)
                 if proj and proj.thread_id and proj.thread_id != cb_thread_id:
                     try:
@@ -2302,7 +2476,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # --- Profile system callbacks ---
     elif data.startswith(CB_PROFILE_LAUNCH):
-        slug = data[len(CB_PROFILE_LAUNCH):]
+        slug = data[len(CB_PROFILE_LAUNCH) :]
         profile = profile_manager.profiles.get(slug)
         if not profile:
             await query.answer("Profile not found", show_alert=True)
@@ -2371,15 +2545,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Bind the topic to this window if we have a thread
         if thread_id and user:
-            session_manager.bind_thread(user.id, thread_id, wid, window_name=profile.slug)
+            session_manager.bind_thread(
+                user.id, thread_id, wid, window_name=profile.slug
+            )
             session_manager.window_display_names[wid] = profile.name
             session_manager._save_state()
 
         # Inject system prompt after a delay (let CLI start up)
         if profile.system_prompt:
+
             async def _inject_prompt() -> None:
                 await asyncio.sleep(8)
-                await tmux_manager.send_keys(wid, profile.system_prompt, enter=True, literal=True)
+                await tmux_manager.send_keys(
+                    wid, profile.system_prompt, enter=True, literal=True
+                )
+
             asyncio.create_task(_inject_prompt())
 
         deep_link = profile_manager.get_telegram_deep_link(slug)
@@ -2396,7 +2576,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("Launched!")
 
     elif data.startswith(CB_PROFILE_SUSPEND):
-        slug = data[len(CB_PROFILE_SUSPEND):]
+        slug = data[len(CB_PROFILE_SUSPEND) :]
         pstate = profile_manager.get_state(slug)
         profile = profile_manager.profiles.get(slug)
         if not pstate.window_id:
@@ -2414,7 +2594,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.answer("Suspended")
 
     elif data.startswith(CB_PROFILE_INFO):
-        slug = data[len(CB_PROFILE_INFO):]
+        slug = data[len(CB_PROFILE_INFO) :]
         profile = profile_manager.profiles.get(slug)
         pstate = profile_manager.get_state(slug)
         if not profile:
@@ -2438,13 +2618,21 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         buttons = []
         if is_active:
-            buttons.append([
-                InlineKeyboardButton("💤 Suspend", callback_data=f"pf:suspend:{slug}"),
-            ])
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "💤 Suspend", callback_data=f"pf:suspend:{slug}"
+                    ),
+                ]
+            )
         else:
-            buttons.append([
-                InlineKeyboardButton("🚀 Launch", callback_data=f"pf:launch:{slug}"),
-            ])
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "🚀 Launch", callback_data=f"pf:launch:{slug}"
+                    ),
+                ]
+            )
 
         keyboard = InlineKeyboardMarkup(buttons) if buttons else None
         await safe_edit(query, info_text, reply_markup=keyboard)
@@ -2458,7 +2646,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Quick-launch a saved profile from the builder menu
         if data.startswith(CB_LB_PROFILE):
-            slug = data[len(CB_LB_PROFILE):]
+            slug = data[len(CB_LB_PROFILE) :]
             profile = profile_manager.profiles.get(slug)
             if not profile:
                 await query.answer("Profile not found", show_alert=True)
@@ -2469,7 +2657,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             # If already active, just tell the user
             if profile_manager.is_active(slug):
-                await safe_edit(query, f"{profile.icon} *{profile.name}* is already active.")
+                await safe_edit(
+                    query, f"{profile.icon} *{profile.name}* is already active."
+                )
                 await query.answer()
                 return
 
@@ -2485,7 +2675,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                         profile_manager.suspend(lru_slug, session_id=sid)
 
             cmd_parts = [
-                profile.backend if profile.backend != "claude" else config.claude_command
+                profile.backend
+                if profile.backend != "claude"
+                else config.claude_command
             ]
             if profile.model:
                 cmd_parts.append(f"--model {profile.model}")
@@ -2509,16 +2701,22 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
             chat = update.effective_chat
             chat_id = chat.id if chat else 0
-            profile_manager.activate(slug, window_id=wid, topic_id=thread_id or 0, chat_id=chat_id)
+            profile_manager.activate(
+                slug, window_id=wid, topic_id=thread_id or 0, chat_id=chat_id
+            )
             if thread_id and user:
-                session_manager.bind_thread(user.id, thread_id, wid, window_name=profile.slug)
+                session_manager.bind_thread(
+                    user.id, thread_id, wid, window_name=profile.slug
+                )
                 session_manager.window_display_names[wid] = profile.name
                 session_manager._save_state()
 
             if profile.system_prompt:
+
                 async def _inject(w=wid, p=profile.system_prompt) -> None:
                     await asyncio.sleep(8)
                     await tmux_manager.send_keys(w, p, enter=True, literal=True)
+
                 asyncio.create_task(_inject())
 
             await safe_edit(
@@ -2534,15 +2732,20 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if not lb:
             # No builder state — start fresh
             lb = {
-                "step": "main", "backend": "", "model": "", "dir_idx": -1,
-                "known_dirs": _get_known_dirs(), "skip_perms": True, "resume": True,
+                "step": "main",
+                "backend": "",
+                "model": "",
+                "dir_idx": -1,
+                "known_dirs": _get_known_dirs(),
+                "skip_perms": True,
+                "resume": True,
             }
             if context.user_data is not None:
                 context.user_data[key] = lb
 
         # Step: pick backend
         if data.startswith(CB_LB_BACKEND):
-            val = data[len(CB_LB_BACKEND):]
+            val = data[len(CB_LB_BACKEND) :]
             if val == "pick":
                 lb["backends"] = _discover_backends()
                 lb["step"] = "backend"
@@ -2554,7 +2757,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Step: pick model (handles provider sub-navigation)
         elif data.startswith(CB_LB_MODEL):
-            val = data[len(CB_LB_MODEL):]
+            val = data[len(CB_LB_MODEL) :]
             if val.startswith("@"):
                 # Provider navigation
                 prov_id = val[1:]
@@ -2570,17 +2773,19 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
         # Step: pick directory
         elif data.startswith(CB_LB_DIR):
-            val = data[len(CB_LB_DIR):]
+            val = data[len(CB_LB_DIR) :]
             if val == "browse":
                 # TODO: wire into directory browser
-                await query.answer("Browse not yet wired — pick a known dir", show_alert=True)
+                await query.answer(
+                    "Browse not yet wired — pick a known dir", show_alert=True
+                )
                 return
             lb["dir_idx"] = int(val)
             lb["step"] = "flags"
 
         # Step: toggle flags
         elif data.startswith(CB_LB_FLAG):
-            flag = data[len(CB_LB_FLAG):]
+            flag = data[len(CB_LB_FLAG) :]
             if flag == "skip":
                 lb["skip_perms"] = not lb.get("skip_perms", True)
             elif flag == "resume":
@@ -2601,9 +2806,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             skip_perms = lb.get("skip_perms", True)
             do_resume = lb.get("resume", True)
 
-            cmd_parts = [
-                backend if backend != "claude" else config.claude_command
-            ]
+            cmd_parts = [backend if backend != "claude" else config.claude_command]
             if model:
                 # OpenCode uses -m provider/model, Claude uses --model alias
                 flag = "-m" if backend == "opencode" else "--model"
@@ -2627,16 +2830,16 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await tmux_manager.send_keys(wid, cli_command, enter=True, literal=True)
 
             if thread_id and user:
-                session_manager.bind_thread(user.id, thread_id, wid, window_name=dir_name)
+                session_manager.bind_thread(
+                    user.id, thread_id, wid, window_name=dir_name
+                )
                 session_manager.window_display_names[wid] = dir_name
                 session_manager._save_state()
 
             model_note = f" ({model})" if model else ""
             await safe_edit(
                 query,
-                f"🚀 *Launched!*\n"
-                f"📂 `{_short_dir(work_dir)}`\n"
-                f"⚙️ {backend}{model_note}",
+                f"🚀 *Launched!*\n📂 `{_short_dir(work_dir)}`\n⚙️ {backend}{model_note}",
             )
             await query.answer("Launched!")
 
@@ -2931,6 +3134,8 @@ async def post_init(application: Application) -> None:
     bot_commands = [
         BotCommand("help", "Command reference — what do I need?"),
         BotCommand("start", "Show welcome message"),
+        BotCommand("new", "Start a new session in this topic"),
+        BotCommand("bind", "Bind this topic to an existing window"),
         BotCommand("history", "Message history for this topic"),
         BotCommand("screenshot", "Terminal screenshot with control keys"),
         BotCommand("esc", "Send Escape to interrupt Claude"),
@@ -2974,7 +3179,9 @@ async def post_init(application: Application) -> None:
         logger.info("Using OpenCode backend (SQLite: %s)", config.opencode_db_path)
     else:
         monitor = SessionMonitor()
-        logger.info("Using Claude Code backend (projects: %s)", config.claude_projects_path)
+        logger.info(
+            "Using Claude Code backend (projects: %s)", config.claude_projects_path
+        )
 
     async def message_callback(msg: NewMessage) -> None:
         await handle_new_message(msg, application.bot)
@@ -3014,7 +3221,9 @@ def create_bot() -> Application:
     application = (
         Application.builder()
         .token(config.telegram_bot_token)
-        .rate_limiter(AIORateLimiter(max_retries=2, overall_max_rate=20, overall_time_period=60))
+        .rate_limiter(
+            AIORateLimiter(max_retries=2, overall_max_rate=20, overall_time_period=60)
+        )
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -3026,6 +3235,8 @@ def create_bot() -> Application:
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("history", history_command))
     application.add_handler(CommandHandler("screenshot", screenshot_command))
+    application.add_handler(CommandHandler("new", new_command))
+    application.add_handler(CommandHandler("bind", bind_command))
     application.add_handler(CommandHandler("esc", esc_command))
     application.add_handler(CommandHandler("unbind", unbind_command))
     application.add_handler(CommandHandler("verbose", verbose_command))

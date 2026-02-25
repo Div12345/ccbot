@@ -25,7 +25,6 @@ from .state import (
     set_project,
 )
 from .discovery import scan_backends, scan_models, scan_sessions
-from .profiles import ProfileManager
 
 logger = logging.getLogger(__name__)
 
@@ -39,18 +38,18 @@ logger = logging.getLogger(__name__)
 class Button:
     """A single inline button."""
 
-    label: str   # Display text, e.g. "Resume"
-    data: str    # Callback data, e.g. "cc:resume:arterial"
+    label: str  # Display text, e.g. "Resume"
+    data: str  # Callback data, e.g. "cc:resume:arterial"
 
 
 @dataclass
 class Response:
     """Structured response returned to the caller (Telegram handler etc.)."""
 
-    type: str                        # "proposal" | "status" | "action_result" | "question"
-    text: str                        # Message body (markdown-lite)
-    buttons: list[list[Button]]      # Rows of buttons (empty list = no buttons)
-    project: str | None = None       # Which project this is about
+    type: str  # "proposal" | "status" | "action_result" | "question"
+    text: str  # Message body (markdown-lite)
+    buttons: list[list[Button]]  # Rows of buttons (empty list = no buttons)
+    project: str | None = None  # Which project this is about
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +72,9 @@ def _clear_setup(chat_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _fuzzy_match_project(text: str, projects: list[ProjectState]) -> ProjectState | None:
+def _fuzzy_match_project(
+    text: str, projects: list[ProjectState]
+) -> ProjectState | None:
     """Return the best-matching project for text, or None."""
     names = [p.name for p in projects]
     text_lower = text.strip().lower()
@@ -89,7 +90,9 @@ def _fuzzy_match_project(text: str, projects: list[ProjectState]) -> ProjectStat
             return p
 
     # Difflib close match
-    close = difflib.get_close_matches(text_lower, [n.lower() for n in names], n=1, cutoff=0.6)
+    close = difflib.get_close_matches(
+        text_lower, [n.lower() for n in names], n=1, cutoff=0.6
+    )
     if close:
         matched_lower = close[0]
         for p in projects:
@@ -119,23 +122,29 @@ def _propose_project(p: ProjectState) -> Response:
 
     if p.alive:
         text = f"{header}\nSession is running. Resume or manage it:"
-        buttons = [[
-            Button("Resume", f"cc:resume:{p.name}"),
-            Button("Compact", f"cc:compact:{p.name}"),
-            Button("Kill", f"cc:kill:{p.name}"),
-        ]]
+        buttons = [
+            [
+                Button("Resume", f"cc:resume:{p.name}"),
+                Button("Compact", f"cc:compact:{p.name}"),
+                Button("Kill", f"cc:kill:{p.name}"),
+            ]
+        ]
     elif p.window_id:
         text = f"{header}\nSession window exists but is idle. Relaunch or start fresh:"
-        buttons = [[
-            Button("Relaunch", f"cc:relaunch:{p.name}"),
-            Button("Fresh start", f"cc:fresh:{p.name}"),
-            Button("Kill", f"cc:kill:{p.name}"),
-        ]]
+        buttons = [
+            [
+                Button("Relaunch", f"cc:relaunch:{p.name}"),
+                Button("Fresh start", f"cc:fresh:{p.name}"),
+                Button("Kill", f"cc:kill:{p.name}"),
+            ]
+        ]
     else:
         text = f"{header}\nNo active session. Start a new one:"
-        buttons = [[
-            Button("New session", f"cc:new:{p.name}"),
-        ]]
+        buttons = [
+            [
+                Button("New session", f"cc:new:{p.name}"),
+            ]
+        ]
 
     return Response(type="proposal", text=text, buttons=buttons, project=p.name)
 
@@ -143,6 +152,50 @@ def _propose_project(p: ProjectState) -> Response:
 # ---------------------------------------------------------------------------
 # New-session wizard helpers
 # ---------------------------------------------------------------------------
+
+
+def wizard_start_for_project(chat_id: int, project_name: str) -> Response:
+    """Start the wizard with profile pre-fill (directory, name, flags).
+
+    Skips directory selection — goes straight to backend → model → confirm.
+    Called from bot layer where chat_id is available.
+    """
+    from .profiles import ProfileManager
+    pm = ProfileManager()
+    profile = pm.get(project_name)
+
+    # Pre-fill setup state from profile
+    prefill: dict = {"name": project_name}
+    if profile:
+        if profile.directory:
+            prefill["directory"] = profile.directory
+        if profile.flags:
+            prefill["_flags"] = profile.flags
+        if profile.system_prompt:
+            prefill["_system_prompt"] = profile.system_prompt
+
+    _pending_setups[chat_id] = prefill
+    _setup_step[chat_id] = "backend"
+
+    backends = scan_backends()
+    installed = [b for b in backends if b["installed"]]
+    if not installed:
+        _clear_setup(chat_id)
+        return Response(
+            type="action_result",
+            text="No backends installed. Install `claude` or `opencode` first.",
+            buttons=[],
+        )
+
+    rows: list[list[Button]] = [
+        [Button(b["name"], f"cc:backend:{b['id']}") for b in installed]
+    ]
+    dir_info = f"\nDir: `{profile.directory}`" if profile and profile.directory else ""
+    return Response(
+        type="question",
+        text=f"Pick a backend for *{project_name}*:{dir_info}",
+        buttons=rows,
+    )
 
 
 def _ask_backend(chat_id: int, name: str | None = None) -> Response:
@@ -160,10 +213,9 @@ def _ask_backend(chat_id: int, name: str | None = None) -> Response:
             buttons=[],
         )
 
-    rows: list[list[Button]] = [[
-        Button(b["name"], f"cc:backend:{b['id']}")
-        for b in installed
-    ]]
+    rows: list[list[Button]] = [
+        [Button(b["name"], f"cc:backend:{b['id']}") for b in installed]
+    ]
     name_part = f" for *{name}*" if name else ""
     return Response(
         type="question",
@@ -178,10 +230,7 @@ def _ask_model(chat_id: int, backend: str) -> Response:
     model_data = scan_models(backend)
     rows: list[list[Button]] = []
     for provider in model_data.get("providers", []):
-        row = [
-            Button(m["name"], f"cc:model:{m['id']}")
-            for m in provider["models"]
-        ]
+        row = [Button(m["name"], f"cc:model:{m['id']}") for m in provider["models"]]
         if row:
             rows.append(row)
     if not rows:
@@ -241,10 +290,12 @@ def _ask_confirm(chat_id: int) -> Response:
     return Response(
         type="proposal",
         text=text,
-        buttons=[[
-            Button("Launch", "cc:go"),
-            Button("Cancel", "cc:cancel"),
-        ]],
+        buttons=[
+            [
+                Button("Launch", "cc:go"),
+                Button("Cancel", "cc:cancel"),
+            ]
+        ],
     )
 
 
@@ -298,7 +349,9 @@ def _launch_session(
         ["tmux", "send-keys", "-t", target, cmd, "Enter"],
         capture_output=True,
     )
-    return True, f"Launched *{name}* with {backend}" + (f" (`{model}`)" if model and model != "default" else "")
+    return True, f"Launched *{name}* with {backend}" + (
+        f" (`{model}`)" if model and model != "default" else ""
+    )
 
 
 def _resume_session(p: ProjectState) -> tuple[bool, str]:
@@ -306,8 +359,11 @@ def _resume_session(p: ProjectState) -> tuple[bool, str]:
     if not p.window_id:
         return False, "No window found"
     from .config import config
+
     target = f"{config.tmux_session_name}:{p.window_id}"
-    subprocess.run(["tmux", "send-keys", "-t", target, "", "Enter"], capture_output=True)
+    subprocess.run(
+        ["tmux", "send-keys", "-t", target, "", "Enter"], capture_output=True
+    )
     return True, f"Sent Enter to *{p.name}*"
 
 
@@ -316,6 +372,7 @@ def _kill_session(p: ProjectState) -> tuple[bool, str]:
     if not p.window_id:
         return False, "No window to kill"
     from .config import config
+
     target = f"{config.tmux_session_name}:{p.window_id}"
     result = subprocess.run(
         ["tmux", "kill-window", "-t", target],
@@ -332,6 +389,7 @@ def _compact_session(p: ProjectState) -> tuple[bool, str]:
     if not p.window_id:
         return False, "No window found"
     from .config import config
+
     target = f"{config.tmux_session_name}:{p.window_id}"
     subprocess.run(
         ["tmux", "send-keys", "-t", target, "/compact", "Enter"],
@@ -407,7 +465,9 @@ def handle(text: str, chat_id: int, thread_id: int | None = None) -> Response:
     # 7. Fallback — guide the user
     # ------------------------------------------------------------------ #
     project_names = [p.name for p in projects]
-    names_str = "  ".join(f"`{n}`" for n in project_names[:8]) if project_names else "(none)"
+    names_str = (
+        "  ".join(f"`{n}`" for n in project_names[:8]) if project_names else "(none)"
+    )
     return Response(
         type="question",
         text=(
@@ -415,7 +475,9 @@ def handle(text: str, chat_id: int, thread_id: int | None = None) -> Response:
             f"*Your projects:* {names_str}\n"
             f"Or say: `new session` | `status`"
         ),
-        buttons=[[Button("Status", "cc:status"), Button("New session", "cc:new_session")]],
+        buttons=[
+            [Button("Status", "cc:status"), Button("New session", "cc:new_session")]
+        ],
     )
 
 
@@ -520,35 +582,10 @@ def handle_action(action: str) -> Response:
     # New session for a named project
     # ------------------------------------------------------------------ #
     if verb == "new":
-        # Use profile to pre-fill and launch directly
-        pm = ProfileManager()
-        profile = pm.get(arg)
-        if profile and profile.directory:
-            ok, msg = _launch_session(
-                arg, profile.backend, profile.model, profile.directory,
-                flags=profile.flags,
-            )
-            if ok and profile.system_prompt:
-                # Send system prompt after a short delay
-                from .config import config as _cfg
-                import time
-                time.sleep(1)
-                target = f"{_cfg.tmux_session_name}:{arg}"
-                subprocess.run(
-                    ["tmux", "send-keys", "-t", target, profile.system_prompt, "Enter"],
-                    capture_output=True,
-                )
-                msg += f"\n_System prompt injected._"
-            return Response(
-                type="action_result",
-                text=msg,
-                buttons=[[Button("Status", "cc:status")]],
-                project=arg,
-            )
-        # No profile or no directory — fall through to wizard
+        # Action callbacks don't include chat_id, so launch wizard from bot command.
         return Response(
             type="question",
-            text=f"No profile found for *{arg}*. Send `new session` to configure.",
+            text=f"Use /new in your topic to launch a new session for *{arg}*.",
             buttons=[],
             project=arg,
         )
@@ -703,6 +740,9 @@ def wizard_select_backend(chat_id: int, backend: str) -> Response:
 def wizard_select_model(chat_id: int, model: str) -> Response:
     """Called by bot layer when user picks a model button."""
     _pending_setups.setdefault(chat_id, {})["model"] = model
+    # Skip directory step if already pre-filled from profile
+    if _pending_setups[chat_id].get("directory"):
+        return _ask_confirm(chat_id)
     return _ask_directory(chat_id)
 
 
@@ -727,9 +767,24 @@ def wizard_go(chat_id: int) -> Response:
     model = setup.get("model", "default")
     directory = setup.get("directory", str(Path.home()))
     name = setup.get("name") or Path(directory).name or "session"
+    flags = setup.get("_flags", "")
+    system_prompt = setup.get("_system_prompt", "")
 
     _clear_setup(chat_id)
-    ok, msg = _launch_session(name, backend, model, directory)
+    ok, msg = _launch_session(name, backend, model, directory, flags=flags)
+
+    # Inject system prompt after launch
+    if ok and system_prompt:
+        import time
+        from .config import config as _cfg
+        time.sleep(1)
+        target = f"{_cfg.tmux_session_name}:{name}"
+        subprocess.run(
+            ["tmux", "send-keys", "-t", target, system_prompt, "Enter"],
+            capture_output=True,
+        )
+        msg += "\n_System prompt injected._"
+
     return Response(
         type="action_result",
         text=msg,
