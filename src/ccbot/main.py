@@ -7,6 +7,7 @@ Handles two execution modes:
 """
 
 import logging
+import os
 import sys
 
 
@@ -17,6 +18,13 @@ def main() -> None:
 
         hook_main()
         return
+
+    # Parse --token before config loads (sets env var so Config picks it up)
+    args = sys.argv[1:]
+    for i, arg in enumerate(args):
+        if arg == "--token" and i + 1 < len(args):
+            os.environ["TELEGRAM_BOT_TOKEN"] = args[i + 1]
+            break
 
     logging.basicConfig(
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",

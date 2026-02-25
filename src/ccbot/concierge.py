@@ -773,17 +773,17 @@ def wizard_go(chat_id: int) -> Response:
     _clear_setup(chat_id)
     ok, msg = _launch_session(name, backend, model, directory, flags=flags)
 
-    # Inject system prompt after launch
+    # Inject system prompt after launch (non-blocking)
     if ok and system_prompt:
-        import time
+        import shlex
         from .config import config as _cfg
-        time.sleep(1)
         target = f"{_cfg.tmux_session_name}:{name}"
-        subprocess.run(
-            ["tmux", "send-keys", "-t", target, system_prompt, "Enter"],
-            capture_output=True,
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 2 && tmux send-keys -t {shlex.quote(target)} {shlex.quote(system_prompt)} Enter"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        msg += "\n_System prompt injected._"
+        msg += "\n_System prompt will be injected._"
 
     return Response(
         type="action_result",

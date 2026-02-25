@@ -1199,13 +1199,13 @@ async def threads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.message:
         return
 
-    logger.warning("threads_command: ENTERED handler")
+    logger.debug("threads_command: ENTERED handler")
     try:
         await update.message.chat.send_action(ChatAction.TYPING)
         from .state import list_projects
 
         projects = list_projects()
-        logger.warning("threads_command: got %d projects", len(projects))
+        logger.debug("threads_command: got %d projects", len(projects))
         lines = ["*Forum Threads*\n"]
         buttons = []
 
@@ -1244,9 +1244,9 @@ async def threads_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         from telegram import InlineKeyboardMarkup
 
         markup = InlineKeyboardMarkup(buttons) if buttons else None
-        logger.warning("threads_command: sending reply: %s", "\n".join(lines)[:200])
+        logger.debug("threads_command: sending reply: %s", "\n".join(lines)[:200])
         await safe_reply(update.message, "\n".join(lines), reply_markup=markup)
-        logger.warning("threads_command: reply sent OK")
+        logger.debug("threads_command: reply sent OK")
     except Exception as e:
         logger.error("threads_command FAILED: %s", e, exc_info=True)
         try:
