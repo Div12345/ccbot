@@ -26,6 +26,26 @@ from ..transcript_parser import TranscriptParser
 
 logger = logging.getLogger(__name__)
 
+
+def _maybe_unbind_thread(error_msg: str, kwargs: dict) -> None:
+    """Auto-unbind thread if Telegram reports it doesn't exist."""
+    if "thread not found" not in str(error_msg).lower():
+        return
+    thread_id = kwargs.get("message_thread_id")
+    if not thread_id:
+        return
+    try:
+        from ..session import session_manager as sm
+
+        for uid, tid, _wid in sm.iter_thread_bindings():
+            if tid == thread_id:
+                sm.unbind_thread(uid, tid)
+                logger.warning("Auto-unbound stale thread %d for user %d", tid, uid)
+                break
+    except Exception:
+        pass
+
+
 # Sentinel characters to strip from plain text fallback
 _SENTINELS = (
     TranscriptParser.EXPANDABLE_QUOTE_START,
@@ -74,6 +94,7 @@ async def send_with_fallback(
             raise
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
+            _maybe_unbind_thread(str(e), kwargs)
             return None
 
 
@@ -189,3 +210,4 @@ async def safe_send(
             raise
         except Exception as e:
             logger.error(f"Failed to send message to {chat_id}: {e}")
+            _maybe_unbind_thread(str(e), kwargs)

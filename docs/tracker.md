@@ -21,8 +21,11 @@
 - [x] Commit + push all new modules
 
 ## Next Up
-- [ ] Thread cleanup — close orphan threads via /threads buttons
+- [x] Thread cleanup — /threads lists orphans + [Close] buttons + cc:close_thread handler
 - [ ] Update .env with Opencode_job_bot token (hook blocks edit)
+- [x] Fix blocking time.sleep(1) in wizard_go → non-blocking Popen
+- [x] Demote debug logger.warning → logger.debug in threads_command
+- [x] Clean stale tmux windows (setup-mcpc from failed opencode agent)
 
 ## Future (after basics work)
 - [ ] Agent-assisted setup (concierge uses cheap model for intelligence)
@@ -34,3 +37,4 @@
 ## Known Issues
 - agent-browser: can't target in-thread reply input (types in "New Thread" area)
 - Duncad_bot: rate-limited until ~6 AM Feb 25 (session monitor flooding)
+- "Message thread not found" if Telegram topic deleted — bot handles gracefully
