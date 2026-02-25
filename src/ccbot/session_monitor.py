@@ -493,13 +493,35 @@ class SessionMonitor:
                 # Check for new messages (all I/O is async)
                 new_messages = await self.check_for_updates(active_session_ids)
 
-                for msg in new_messages:
-                    status = "complete" if msg.is_complete else "streaming"
-                    preview = msg.text[:80] + ("..." if len(msg.text) > 80 else "")
-                    logger.info("[%s] session=%s: %s", status, msg.session_id, preview)
-                    if self._message_callback:
+                # Batch messages per session — emit one combined message per cycle
+                if new_messages and self._message_callback:
+                    batched: dict[str, list[NewMessage]] = {}
+                    for msg in new_messages:
+                        batched.setdefault(msg.session_id, []).append(msg)
+
+                    for session_id, msgs in batched.items():
+                        if len(msgs) == 1:
+                            combined = msgs[0]
+                        else:
+                            # Combine text, keep last message's metadata
+                            texts = [m.text for m in msgs if m.text]
+                            combined = NewMessage(
+                                session_id=session_id,
+                                text="\n".join(texts),
+                                is_complete=msgs[-1].is_complete,
+                                content_type=msgs[-1].content_type,
+                                role=msgs[-1].role,
+                                tool_name=msgs[-1].tool_name,
+                                image_data=msgs[-1].image_data,
+                            )
+                        preview = combined.text[:80] + ("..." if len(combined.text) > 80 else "")
+                        logger.info(
+                            "[%s] session=%s (%d batched): %s",
+                            "complete" if combined.is_complete else "streaming",
+                            session_id, len(msgs), preview,
+                        )
                         try:
-                            await self._message_callback(msg)
+                            await self._message_callback(combined)
                         except Exception as e:
                             logger.error(f"Message callback error: {e}")
 
